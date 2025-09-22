@@ -1,4 +1,145 @@
-#include "salloc.h"
 #include <stdio.h>
-#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+
+#define PORT 8080
+#define MAX_EVENTS 64
+
+int make_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+int main() {
+    int listen_fd;
+    struct sockaddr_in address;
+
+    // Create socket
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Allow reuse of port
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Bind socket
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(listen_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Listen
+    if (listen(listen_fd, SOMAXCONN) < 0) {
+        perror("listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Make nonblocking
+    make_nonblocking(listen_fd);
+
+    // Epoll setup
+    int ep_fd = epoll_create1(0);
+    if (ep_fd < 0) {
+        perror("epoll_create1 failed");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd;
+    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
+        perror("epoll_ctl failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server running on http://localhost:%d\n", PORT);
+
+    // Main loop
+    while (1) {
+        struct epoll_event events[MAX_EVENTS];
+        int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
+        if (n < 0) {
+            perror("epoll_wait failed");
+            break;
+        }
+
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;
+
+            if (fd == listen_fd) {
+                // Accept new client
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) continue;
+
+                make_nonblocking(client_fd);
+
+                struct epoll_event client_ev;
+                client_ev.events = EPOLLIN;
+                client_ev.data.fd = client_fd;
+                epoll_ctl(ep_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
+            } else {
+                // Handle client request
+                char buffer[2048];
+                int bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+
+                if (bytes_read <= 0) {
+                    close(fd);
+                    continue;
+                }
+
+                buffer[bytes_read] = '\0';
+                printf("Request:\n%s\n", buffer);
+
+                // Parse simple HTTP request line
+                char method[8], path[1024], protocol[16];
+                sscanf(buffer, "%7s %1023s %15s", method, path, protocol);
+
+                const char *body;
+                char resp[2048];
+                int len;
+
+                if (strcmp(path, "/helloworld!") == 0) {
+                    body = "helloworld!";
+                    len = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "\r\n"
+                        "%s",
+                        strlen(body), body);
+                } else {
+                    body = "Not Found Dipshit";
+                    len = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 404 Not Found\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "\r\n"
+                        "%s",
+                        strlen(body), body);
+                }
+
+                write(fd, resp, len);
+                close(fd); // simple: close after response
+            }
+        }
+    }
+
+    close(listen_fd);
+    //return 0;
+}
