@@ -90,6 +90,8 @@ void *work(void *arg) {
         if (n < 0) { perror("epoll_wait failed"); break; }
 
         for (int i = 0; i < n; i++) {
+	    uint64_t count;
+	    read(job->ev_fd, &count, sizeof(count));
             int fd = events[i].data.fd;
             if (fd == job->ev_fd) {
                 uint64_t count;
@@ -119,55 +121,57 @@ int main() {
 		exit(EXIT_FAILURE);
 	}
 
-    // Listen
-    if (listen(listen_fd, SOMAXCONN) < 0) {
-        perror("listen failed");
-        exit(EXIT_FAILURE);
-    }
+	// Listen
+	if (listen(listen_fd, SOMAXCONN) < 0) {
+		perror("listen failed");
+		exit(EXIT_FAILURE);
+	}
 
-    // Make nonblocking
-    make_nonblocking(listen_fd);
-	
-    int ep_fd = epoll_create1(0);
-    if (ep_fd < 0) perror("epoll_create1 failed"); exit(EXIT_FAILURE);
+	// Make nonblocking
+	make_nonblocking(listen_fd);
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = listen_fd;
-    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
-        perror("epoll_ctl failed");
-        exit(EXIT_FAILURE);
-    }
+	int ep_fd = epoll_create1(0);
+	if (ep_fd < 0) perror("epoll_create1 failed"); exit(EXIT_FAILURE);
 
-    struct epoll_event events[MAX_EVENTS];
+	struct epoll_event ev;
+	ev.events = EPOLLIN;
+	ev.data.fd = listen_fd;
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
+		perror("epoll_ctl failed");
+		exit(EXIT_FAILURE);
+	}
 
-    worker thread[THREAD_COUNT];
-    int i;
-    while(i < THREAD_COUNT) {
-	    pthread_create(&thread[i].tid, NULL, work, &thread[i]);
-	    i++;
-    }
+	struct epoll_event events[MAX_EVENTS];
 
-    while(1) {
-    int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
-    if(n < 0) {
-	    perror("epoll_wait failed"); exit(EXIT_FAILURE);
-    }
-	    i = 0;
-	    while(i < n){
-		    int fd = events[i].data.fd;
-		    if(fd == listen_fd){
-			    struct sockaddr_in client_addr;
-			    socklen_t client_len = sizeof(client_addr);
-			    int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-			    if(client_fd < 0)continue;
-			    make_nonblocking(client_fd);
+	worker thread[THREAD_COUNT];
+	int i = 0;
+	while(i < THREAD_COUNT) {
+		pthread_create(&thread[i].tid, NULL, work, &thread[i]);
+		i++;
+	}
 
-                struct epoll_event client_ev;
-                client_ev.events = EPOLLIN;
-                client_ev.data.fd = client_fd;
-                epoll_ctl(thread[1].ep_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
-		    }
-	    }
-    }
+	while(1) {
+		int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
+		if(n < 0) {
+			perror("epoll_wait failed"); exit(EXIT_FAILURE);
+		}
+		i = 0;
+		while(i < n){
+			int fd = events[i].data.fd;
+			if(fd == listen_fd){
+				struct sockaddr_in client_addr;
+				socklen_t client_len = sizeof(client_addr);
+				int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+				if(client_fd < 0)continue;
+				make_nonblocking(client_fd);
+
+				struct epoll_event client_ev;
+				client_ev.events = EPOLLIN;
+				client_ev.data.fd = client_fd;
+				uint64_t one = 1;
+				write(thread[1].ev_fd, &one, sizeof(one));
+				i++;
+			}
+		}
+	}
 }
