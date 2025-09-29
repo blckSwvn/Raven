@@ -56,13 +56,30 @@ void processClient(int fd) {
 	}
 	int f = open(filepath, O_RDONLY);
 	if(f < 0) {
-		const char *not_found =
-		"HTTP/1.1 404 Not Found\r\n"
-		"Content-Length: 13\r\n"
-		"Content-Type: text/plain\r\n\r\n"
-		"404 Not Found";
-		send(fd, not_found, strlen(not_found), 0);
-		return;
+		int n = open("../www/404.html", O_RDONLY);
+		if(n < 0) {
+			const char *not_found =
+				"HTTP/1.1 404 Not Found\r\n"
+				"Content-Length: 13\r\n"
+				"Content-Type: text/plain\r\n\r\n"
+				"404 Not Found";
+			send(fd, not_found, strlen(not_found), 0);
+			return;
+		} else {
+			const char *header =
+				"HTTP/1.1 404 Not Found\r\n"
+				"Content-Type: text/html\r\n\r\n";
+			send(fd, header, strlen(header), 0);
+
+			char buf2[4096];
+			ssize_t bytes;
+			while((bytes = read(n, buf2, sizeof(buf2))) > 0) {
+				send(fd, buf2, bytes, 0);
+			}
+			close(n);
+			shutdown(fd, SHUT_WR);
+			return;
+		}
 	}
 
 	const char *header =
