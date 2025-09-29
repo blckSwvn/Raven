@@ -1,3 +1,4 @@
+#include "picohttpparser.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,41 +34,47 @@ int make_nonblocking(int fd) {
 }
 
 void processClient(int fd) {
-	char buffer[2048];
-	int bytes_read = read(fd, buffer, sizeof(buffer) -1);
-	if (bytes_read <= 0) { close(fd); return; }
+	char buf[4096]; 
+	const char *method, *path;
+	char filepath[512];
+	int pret, minor_version;
+	struct phr_header headers[16];
+	size_t buf_len = 0, prevbuflen = 0, method_len, path_len; 
+	size_t num_headers = sizeof(headers)/sizeof(headers[0]);
+	// ssize_t rret;
 
-	buffer[bytes_read] = '\0';
-	printf("Request:\n%s\n", buffer);
+	buf_len = recv(fd, buf, sizeof(buf), 0);
+	if(buf_len <= 0) return;
 
-	// Parse simple HTTP request line
-	char method[8], path[1024], protocol[16];
-	sscanf(buffer, "%7s %1023s %15s", method, path, protocol);
+	pret = phr_parse_request(buf, buf_len, &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers, prevbuflen);
+	if(pret <= 0) return;
 
-	const char *body;
-	char resp[2048];
-	int len;
-
-	if (strcmp(path, "/hello") == 0) {
-		body = "hello";
-		len = snprintf(resp, sizeof(resp),
-				"HTTP/1.1 200 OK\r\n"
-				"Content-Length: %zu\r\n"
-				"Content-Type: text/plain\r\n\r\n"
-				"%s",
-				strlen(body), body);
+	if(path_len == 1 && path[0] == '/') {
+		snprintf(filepath, sizeof(filepath), "../www/index.html");
 	} else {
-		body = "Not Found Dipshit";
-		len = snprintf(resp, sizeof(resp),
-				"HTTP/1.1 404 Not Found\r\n"
-				"Content-Length: %zu\r\n"
-				"Content-Type: text/plain\r\n\r\n"
-				"%s",
-				strlen(body), body);
+		snprintf(filepath, sizeof(filepath), "../www/%.*s", (int)path_len -1, path +1);
+	}
+	int f = open(filepath, O_RDONLY);
+	if(f < 0) {
+		const char *not_found =
+		"HTTP/1.1 404 Not Found\r\n"
+		"Content-Length: 13\r\n"
+		"Content-Type: text/plain\r\n\r\n"
+		"404 Not Found";
+		send(fd, not_found, strlen(not_found), 0);
+		return;
 	}
 
-	write(fd, resp, len);
-	close(fd);
+	const char *header =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html\r\n\r\n";
+	send(fd, header, strlen(header), 0);
+	char buf2[4096];
+	ssize_t n;
+	while((n = read(f, buf2, sizeof(buf2))) > 0) {
+		send(fd, buf2, n, 0);
+	}
+	shutdown(fd, SHUT_WR);
 }
 
 void *work(void *arg) {
@@ -113,10 +120,10 @@ void *work(void *arg) {
 			if (fd == job->ev_fd) {
 				uint64_t count;
 				read(job->ev_fd, &count, sizeof(count)); // drain eventfd
-									 // Here you would pull sockets from a shared queue (not implemented)
-				printf("Worker woken up, count=%llu\n", (unsigned long long)count);
 			} else {
 				processClient(fd);
+				epoll_ctl(job->ep_fd, EPOLL_CTL_DEL, fd, NULL);
+				close(fd);
 			}
 		}
 	}
@@ -129,6 +136,7 @@ int main() {
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0) { perror("socket failed"); exit(EXIT_FAILURE); }
 
+
 	adress.sin_family = AF_INET;
 	adress.sin_addr.s_addr = INADDR_ANY;
 	adress.sin_port = htons(PORT);
@@ -137,6 +145,9 @@ int main() {
 		perror("binds failed");
 		exit(EXIT_FAILURE);
 	}
+
+	int opt = 1;
+	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	// Listen
 	if (listen(listen_fd, SOMAXCONN) < 0) {
