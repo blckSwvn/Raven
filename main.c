@@ -48,8 +48,8 @@ void processClient(int fd) {
 	char resp[2048];
 	int len;
 
-	if (strcmp(path, "/helloworld!") == 0) {
-		body = "helloworld!";
+	if (strcmp(path, "/hello") == 0) {
+		body = "hello";
 		len = snprintf(resp, sizeof(resp),
 				"HTTP/1.1 200 OK\r\n"
 				"Content-Length: %zu\r\n"
@@ -166,6 +166,8 @@ int main() {
 		pthread_create(&thread[i].tid, NULL, work, &thread[i]);
 		i++;
 	}
+
+
 	printf("server listening on port %i\n", PORT);
 
 	while(1) {
