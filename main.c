@@ -1,5 +1,6 @@
 #include "picohttpparser.h"
-#include "strings.h"
+#include "salloc.h"
+#include "signal.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,20 @@ void get_threads(){
 	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
 	if (nprocs > 0) THREAD_COUNT = nprocs;
 	printf("detected nprocs %d\n", THREAD_COUNT);
+}
+
+long ALLMEM = 100;
+long AVPHYS_PAGES = 100;
+long PAGE_SIZE = 100;
+
+//_SC_PHYS_PAGES how many mem pages
+//_SC_AVPHYS_PAGES how many available mem pages
+//_SC_PAGE_SIZE how big a page is in bytes
+void get_mem(){
+	PAGE_SIZE = sysconf(_SC_PHYS_PAGES);
+	AVPHYS_PAGES = sysconf(_SC_AVPHYS_PAGES);
+	ALLMEM = PAGE_SIZE * AVPHYS_PAGES;
+	ALLMEM = ALLMEM - (ALLMEM/2);
 }
 
 typedef struct worker {
@@ -191,6 +206,9 @@ void *work(void *arg) {
 
 int main() {
 	get_threads();
+	get_mem();
+	printf("ALLMEM:%zu\n", ALLMEM);
+
 	int listen_fd;
 	struct sockaddr_in adress;
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
