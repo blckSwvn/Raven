@@ -1,4 +1,5 @@
 #include "picohttpparser.h"
+#include "strings.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,11 +12,11 @@
 #include <netinet/in.h>
 #include <sys/eventfd.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 #define PORT 8080
 #define MAX_EVENTS 64
 #define QUE_SIZE 255
-
 
 int THREAD_COUNT = 1;
 
@@ -41,66 +42,99 @@ int make_nonblocking(int fd) {
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+
 void processClient(int fd) {
-	char buf[4096]; 
-	const char *method, *path;
-	char filepath[512];
-	int pret, minor_version;
-	struct phr_header headers[16];
-	size_t buf_len = 0, prevbuflen = 0, method_len, path_len; 
-	size_t num_headers = sizeof(headers)/sizeof(headers[0]);
-	// ssize_t rret;
+    char buf[4096]; 
+    const char *method, *path;
+    char filepath[512];
+    int pret, minor_version;
+    struct phr_header headers[16];
+    size_t buf_len = 0, prevbuflen = 0, method_len, path_len; 
+    size_t num_headers = sizeof(headers)/sizeof(headers[0]);
 
-	buf_len = recv(fd, buf, sizeof(buf), 0);
-	if(buf_len <= 0) return;
+    buf_len = recv(fd, buf, sizeof(buf), 0);
+    if (buf_len <= 0) return;
 
-	pret = phr_parse_request(buf, buf_len, &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers, prevbuflen);
-	if(pret <= 0) return;
+    pret = phr_parse_request(buf, buf_len,
+                             &method, &method_len,
+                             &path, &path_len,
+                             &minor_version, headers, &num_headers,
+                             prevbuflen);
+    if (pret <= 0) return;
+    
+    // Build full path
+    if (path_len == 1 && path[0] == '/') {
+        snprintf(filepath, sizeof(filepath), "../www/index.html");
+    } else if (path_len > 0 && path[path_len - 1] == '/') {
+        snprintf(filepath, sizeof(filepath), "../www/%.*sindex.html",
+                 (int)path_len, path);
+    } else {
+        snprintf(filepath, sizeof(filepath), "../www/%.*s",
+                 (int)path_len, path);
+    }
 
-	if(path_len == 1 && path[0] == '/') {
-		snprintf(filepath, sizeof(filepath), "../www/index.html");
-	} else {
-		snprintf(filepath, sizeof(filepath), "../www/%.*s", (int)path_len -1, path +1);
-	}
-	int f = open(filepath, O_RDONLY);
-	if(f < 0) {
-		int n = open("../www/404.html", O_RDONLY);
-		if(n < 0) {
-			const char *not_found =
-				"HTTP/1.1 404 Not Found\r\n"
-				"Content-Length: 13\r\n"
-				"Content-Type: text/plain\r\n\r\n"
-				"404 Not Found";
-			send(fd, not_found, strlen(not_found), 0);
-			return;
-		} else {
-			const char *header =
-				"HTTP/1.1 404 Not Found\r\n"
-				"Content-Type: text/html\r\n\r\n";
-			send(fd, header, strlen(header), 0);
+    int f = open(filepath, O_RDONLY);
+    if (f < 0) {
+        // Fallback 404 page
+        int f404 = open("../www/404.html", O_RDONLY);
+        if (f404 < 0) {
+            const char *not_found =
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 13\r\n"
+                "Content-Type: text/plain\r\n\r\n"
+                "404 Not Found";
+            send(fd, not_found, strlen(not_found), 0);
+            shutdown(fd, SHUT_WR);
+            return;
+        } else {
+	// size_t i = 0;
+	// while(i > num_headers) {
+	// 	if(strcpy(headers[i].name))
+	// 	i++;
+	// }
 
-			char buf2[4096];
-			ssize_t bytes;
-			while((bytes = read(n, buf2, sizeof(buf2))) > 0) {
-				send(fd, buf2, bytes, 0);
-			}
-			close(n);
-			shutdown(fd, SHUT_WR);
-			return;
-		}
-	}
+            struct stat st;
+            if (fstat(f404, &st) == 0) {
+                char header[256];
+                int hlen = snprintf(header, sizeof(header),
+                    "HTTP/1.1 404 Not Found\r\n"
+                    "Content-Type: text/html\r\n"
+                    "Content-Length: %jd\r\n\r\n",
+                    (intmax_t)st.st_size);
+                send(fd, header, hlen, 0);
 
-	const char *header =
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/html\r\n\r\n";
-	send(fd, header, strlen(header), 0);
-	char buf2[4096];
-	ssize_t n;
-	while((n = read(f, buf2, sizeof(buf2))) > 0) {
-		send(fd, buf2, n, 0);
-	}
-	shutdown(fd, SHUT_WR);
+                char buf2[4096];
+                ssize_t r;
+                while ((r = read(f404, buf2, sizeof(buf2))) > 0) {
+                    send(fd, buf2, r, 0);
+                }
+            }
+            close(f404);
+            shutdown(fd, SHUT_WR);
+            return;
+        }
+    }
+
+    struct stat st;
+    if (fstat(f, &st) == 0) {
+        char header[256];
+        int hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: %jd\r\n\r\n",
+            (intmax_t)st.st_size);
+        send(fd, header, hlen, 0);
+
+        char buf2[4096];
+        ssize_t r;
+        while ((r = read(f, buf2, sizeof(buf2))) > 0) {
+            send(fd, buf2, r, 0);
+        }
+    }
+    close(f);
+    shutdown(fd, SHUT_WR);
 }
+
 
 void *work(void *arg) {
 	worker *job = (worker *)arg;
@@ -162,6 +196,12 @@ int main() {
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0) { perror("socket failed"); exit(EXIT_FAILURE); }
 
+	int opt = 1;
+    // Allow reuse of address and port
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
 
 	adress.sin_family = AF_INET;
 	adress.sin_addr.s_addr = INADDR_ANY;
@@ -171,9 +211,6 @@ int main() {
 		perror("binds failed");
 		exit(EXIT_FAILURE);
 	}
-
-	int opt = 1;
-	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	// Listen
 	if (listen(listen_fd, SOMAXCONN) < 0) {
