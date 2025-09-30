@@ -12,10 +12,18 @@
 #include <sys/eventfd.h>
 #include <pthread.h>
 
-#define THREAD_COUNT 6
 #define PORT 8080
 #define MAX_EVENTS 64
 #define QUE_SIZE 255
+
+
+int THREAD_COUNT = 1;
+
+void get_threads(){
+	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nprocs > 0) THREAD_COUNT = nprocs;
+	printf("detected nprocs %d\n", THREAD_COUNT);
+}
 
 typedef struct worker {
 	uint8_t busy_count;
@@ -148,6 +156,7 @@ void *work(void *arg) {
 }
 
 int main() {
+	get_threads();
 	int listen_fd;
 	struct sockaddr_in adress;
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
