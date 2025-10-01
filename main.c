@@ -27,7 +27,7 @@ void get_threads(){
 	printf("detected nprocs %d\n", THREAD_COUNT);
 }
 
-long ALLMEM = 100;
+long ALLMEM = 1000;
 long AVPHYS_PAGES = 100;
 long PAGE_SIZE = 100;
 
