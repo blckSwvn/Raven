@@ -1,6 +1,6 @@
 # Compiler
 CC = gcc
-CFLAGS = -Wall -Wextra -O2
+CFLAGS = -Wall -Wextra -O2 -fsanitize=undefined -fsanitize=address -g
 
 INCLUDES = -I./salloc -I./picohttpparser
 
@@ -8,7 +8,7 @@ INCLUDES = -I./salloc -I./picohttpparser
 TARGET = main
 
 # Source files
-SRCS = main.c salloc/salloc.c picohttpparser/picohttpparser.c
+SRCS = main.c picohttpparser/picohttpparser.c arena.c
 OBJS = $(SRCS:.c=.o)
 
 # Default rule

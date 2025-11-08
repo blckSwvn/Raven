@@ -1,301 +1,238 @@
-#include "picohttpparser.h"
-#include "salloc.h"
-#include "signal.h"
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include "picohttpparser/picohttpparser.h"
+#include "arena.h"
 #include <arpa/inet.h>
+#include <stdio.h>
+#include <malloc.h> //remove later
 #include <fcntl.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/eventfd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+
+typedef struct {
+	const char *method;
+	size_t method_len;
+	const char *path;
+	size_t path_len;
+	int minor_version;
+	struct phr_header headers[16];
+	size_t num_headers;
+} HTTPRequest;
 
 #define PORT 8080
-#define MAX_EVENTS 64
-#define QUE_SIZE 255
+#define MAX_EVENTS 255
 
-int THREAD_COUNT = 1;
+long procs = 0;
 
-void get_threads(){
-	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-	if (nprocs > 0) THREAD_COUNT = nprocs;
-	printf("detected nprocs %d\n", THREAD_COUNT);
+long all_mem = 0;
+long page_size = 0;
+long avphys_pages = 0;
+
+long get_threads(){
+	procs = sysconf(_SC_NPROCESSORS_ONLN);
+	return procs;
 }
 
-long ALLMEM = 1000;
-long AVPHYS_PAGES = 100;
-long PAGE_SIZE = 100;
 
-//_SC_PHYS_PAGES how many mem pages
-//_SC_AVPHYS_PAGES how many available mem pages
-//_SC_PAGE_SIZE how big a page is in bytes
 void get_mem(){
-	PAGE_SIZE = sysconf(_SC_PHYS_PAGES);
-	AVPHYS_PAGES = sysconf(_SC_AVPHYS_PAGES);
-	ALLMEM = PAGE_SIZE * AVPHYS_PAGES;
-	ALLMEM = ALLMEM - (ALLMEM/2);
+	page_size = sysconf(_SC_PHYS_PAGES);
+	avphys_pages = sysconf(_SC_AVPHYS_PAGES);
+	all_mem = page_size * avphys_pages;
 }
 
-typedef struct worker {
-	uint8_t busy_count;
-	int ev_fd;
-	int ep_fd;
-	pthread_t tid;
-	uint8_t head;
-	uint8_t tail;
-	int que[QUE_SIZE];
-} worker;
 
-int make_nonblocking(int fd) {
+void *work(void *arg){
+	pthread_exit(NULL);
+}
+
+
+inline int make_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) return -1;
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 
-void processClient(int fd) {
-    char buf[4096]; 
-    const char *method, *path;
-    char filepath[512];
-    int pret, minor_version;
-    struct phr_header headers[16];
-    size_t buf_len = 0, prevbuflen = 0, method_len, path_len; 
-    size_t num_headers = sizeof(headers)/sizeof(headers[0]);
+int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
+	req->num_headers = 16;
 
-    buf_len = recv(fd, buf, sizeof(buf), 0);
-    if (buf_len <= 0) return;
+	int pret = phr_parse_request(buf, buf_len,
+			&req->method, &req->method_len,
+			&req->path, &req->path_len,
+			&req->minor_version, req->headers, &req->num_headers,
+			0);
 
-    pret = phr_parse_request(buf, buf_len,
-                             &method, &method_len,
-                             &path, &path_len,
-                             &minor_version, headers, &num_headers,
-                             prevbuflen);
-    if (pret <= 0) return;
-    
-    // Build full path
-    if (path_len == 1 && path[0] == '/') {
-        snprintf(filepath, sizeof(filepath), "../www/index.html");
-    } else if (path_len > 0 && path[path_len - 1] == '/') {
-        snprintf(filepath, sizeof(filepath), "../www/%.*sindex.html",
-                 (int)path_len, path);
-    } else {
-        snprintf(filepath, sizeof(filepath), "../www/%.*s",
-                 (int)path_len, path);
-    }
-
-    int f = open(filepath, O_RDONLY);
-    if (f < 0) {
-        // Fallback 404 page
-        int f404 = open("../www/404.html", O_RDONLY);
-        if (f404 < 0) {
-            const char *not_found =
-                "HTTP/1.1 404 Not Found\r\n"
-                "Content-Length: 13\r\n"
-                "Content-Type: text/plain\r\n\r\n"
-                "404 Not Found";
-            send(fd, not_found, strlen(not_found), 0);
-            shutdown(fd, SHUT_WR);
-            return;
-        } else {
-	// size_t i = 0;
-	// while(i > num_headers) {
-	// 	if(strcpy(headers[i].name))
-	// 	i++;
-	// }
-
-            struct stat st;
-            if (fstat(f404, &st) == 0) {
-                char header[256];
-                int hlen = snprintf(header, sizeof(header),
-                    "HTTP/1.1 404 Not Found\r\n"
-                    "Content-Type: text/html\r\n"
-                    "Content-Length: %jd\r\n\r\n",
-                    (intmax_t)st.st_size);
-                send(fd, header, hlen, 0);
-
-                char buf2[4096];
-                ssize_t r;
-                while ((r = read(f404, buf2, sizeof(buf2))) > 0) {
-                    send(fd, buf2, r, 0);
-                }
-            }
-            close(f404);
-            shutdown(fd, SHUT_WR);
-            return;
-        }
-    }
-
-    struct stat st;
-    if (fstat(f, &st) == 0) {
-        char header[256];
-        int hlen = snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: %jd\r\n\r\n",
-            (intmax_t)st.st_size);
-        send(fd, header, hlen, 0);
-
-        char buf2[4096];
-        ssize_t r;
-        while ((r = read(f, buf2, sizeof(buf2))) > 0) {
-            send(fd, buf2, r, 0);
-        }
-    }
-    close(f);
-    shutdown(fd, SHUT_WR);
+	return pret; // >0 means sucess, -1 means error, -2 = incomplete
 }
 
-
-void *work(void *arg) {
-	worker *job = (worker *)arg;
-	job->busy_count = 0;
-	job->head = 0;
-	job->tail = 0;
-	job->ep_fd = epoll_create1(0);
-	if (job->ep_fd < 0) { perror("epoll_create1 failed"); pthread_exit(NULL); }
-
-	job->ev_fd = eventfd(0, EFD_NONBLOCK);
-	if (job->ev_fd < 0) { perror("eventfd failed"); pthread_exit(NULL); }
-
-	struct epoll_event events[MAX_EVENTS];
-	struct epoll_event ev;
-	ev.events = EPOLLIN;
-	ev.data.fd = job->ev_fd;
-
-	// Register eventfd **once** before the loop
-	if (epoll_ctl(job->ep_fd, EPOLL_CTL_ADD, job->ev_fd, &ev) < 0) {
-		perror("epoll_ctl failed");
-		pthread_exit(NULL);
+void *process_client(int fd, HTTPRequest *req){
+	char filepath[512];
+	//builds fullpath
+	if(req->path_len == 1 && req->path[0] == '/') {
+		snprintf(filepath, sizeof(filepath), "../www/index.html");
+	} else if (req->path_len > 0 && req->path[req->path_len -1] == '/'){
+		snprintf(filepath, sizeof(filepath), "../www/%.*sindex.html",
+				(int)req->path_len, req->path);
+	} else {
+		snprintf(filepath, sizeof(filepath), "../www/%.*s",
+				(int)req->path_len, req->path);
 	}
 
-	while (1) {
-		int n = epoll_wait(job->ep_fd, events, MAX_EVENTS, -1);
-		if (n < 0) { perror("epoll_wait failed"); break; }
+	int f = open(filepath, O_RDONLY);
+	if(f < 0){
+		int f404 = open("../www/404.html", O_RDONLY);
+		if(f404 < 0){
+			const char *not_found =
+				"HTTP/1.1 404 Not Found\r\n"
+				"Content-Length: 13\r\n"
+				"Content-Type: text/html\r\n\r\n"
+				"404 Not Found";
+			send(fd, not_found, strlen(not_found), 0);
+			shutdown(fd, SHUT_WR);
+			return NULL;
+		} else {
+			struct stat st;
+			if (fstat(f404, &st) == 0) {
+				char header[256];
+				int hlen = snprintf(header, sizeof(header),
+						"HTTP/1.1 404 not found\r\n"
+						"Content-Type: text/html\r\n"
+						"Content-Length: %jd\r\n\r\n",
+						(intmax_t)st.st_size);
+				send(fd, header, hlen, 0);
 
-		for (int i = 0; i < n; i++) {
-
-			while(job->busy_count > 0) {
-				int client_fd = job->que[job->head];
-				job->head++;
-				job->busy_count--;
-
-				struct epoll_event client_ev;
-				client_ev.events = EPOLLIN;
-				client_ev.data.fd = client_fd;
-				epoll_ctl(job->ep_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
+				char buf2[4096];
+				ssize_t r;
+				while ((r = read(f404, buf2, sizeof(buf2))) > 0) {
+					send(fd, buf2, r, 0);
+				}
 			}
-
-			int fd = events[i].data.fd;
-			if (fd == job->ev_fd) {
-				uint64_t count;
-				read(job->ev_fd, &count, sizeof(count)); // drain eventfd
-			} else {
-				processClient(fd);
-				epoll_ctl(job->ep_fd, EPOLL_CTL_DEL, fd, NULL);
-				close(fd);
-			}
+			close(f404);
+			shutdown(fd, SHUT_WR);
+			return NULL;
 		}
 	}
-	pthread_exit(NULL);
+
+	struct stat st;
+	if(fstat(f, &st) == 0){
+		char header[256];
+		int hlen = snprintf(header, sizeof(header),
+				"HTTP/1.1 200 OK\r\n"
+				"Content-Type: text/html\r\n"
+				"Content-Length: %jd\r\n\r\n",
+				(intmax_t)st.st_size);
+		send(fd, header, hlen, 0);
+		char buf2[4096];
+		ssize_t r;
+		while((r = read(f, buf2, sizeof(buf2))) > 0){
+			send(fd, buf2, r, 0);
+		}
+	}
+	close(f);
+	shutdown(fd, SHUT_WR);
+	return NULL;
+
 }
 
-int main() {
+
+int main(){
 	get_threads();
 	get_mem();
-	printf("ALLMEM:%zu\n", ALLMEM);
 
-	int listen_fd;
+
 	struct sockaddr_in adress;
-	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(listen_fd < 0) { perror("socket failed"); exit(EXIT_FAILURE); }
-
-	int opt = 1;
-    // Allow reuse of address and port
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(listen_fd < 0){
+		perror("socket failed");
+	} 
 
 	adress.sin_family = AF_INET;
 	adress.sin_addr.s_addr = INADDR_ANY;
 	adress.sin_port = htons(PORT);
 
-	if(bind(listen_fd, (struct sockaddr *)&adress, sizeof(adress)) < 0) {
-		perror("binds failed");
-		exit(EXIT_FAILURE);
+	if(bind(listen_fd,(struct sockaddr *)&adress, sizeof(adress)) < 0){
+		perror("binds failed");	
 	}
 
-	// Listen
-	if (listen(listen_fd, SOMAXCONN) < 0) {
-		perror("listen failed");
-		exit(EXIT_FAILURE);
-	}
+	listen(listen_fd, SOMAXCONN);
 
-	// Make nonblocking
 	make_nonblocking(listen_fd);
 
-	int ep_fd = epoll_create1(0);
-	if (ep_fd < 0) { perror("epoll_create1 failed"); exit(EXIT_FAILURE); }
+	int epoll_fd = epoll_create1(0);
 
 	struct epoll_event ev;
 	ev.events = EPOLLIN;
 	ev.data.fd = listen_fd;
-	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
-		perror("epoll_ctl failed");
-		exit(EXIT_FAILURE);
-	}
+	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 
 	struct epoll_event events[MAX_EVENTS];
 
-	worker thread[THREAD_COUNT];
-	int i = 0;
-	while(i < THREAD_COUNT) {
-		pthread_create(&thread[i].tid, NULL, work, &thread[i]);
-		i++;
-	}
+	printf("server listenning on port %i\n", PORT);
 
+	//add multi threading later
+	// pthread_t worker[procs];
+	// uint i = 0;
+	// while(i < procs){
+	// 	pthread_create(&worker[i], NULL, work, NULL); 
+	// 	i++;
+	// }
 
-	printf("server listening on port %i\n", PORT);
+	while(1){
+		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
-	while(1) {
-		int n = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
-		if(n < 0) {
-			perror("epoll_wait failed"); exit(EXIT_FAILURE);
-		}
-		i = 0;
-		while(i < n){
+		int i = 0;
+		while(wait > i){
 			int fd = events[i].data.fd;
+			//register new client
+			struct sockaddr_in client_addr;
+			socklen_t client_len = sizeof(client_addr);
 			if(fd == listen_fd){
-				struct sockaddr_in client_addr;
-				socklen_t client_len = sizeof(client_addr);
-				int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-				if(client_fd < 0)continue;
-				make_nonblocking(client_fd);
+				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
 
-				uint8_t y = 0;
-				uint8_t least_index = 0;
-				uint8_t min_load = 255;
+				if(new_client_fd < 0)continue;
 
-				while(y < THREAD_COUNT) {
-					if(thread[y].busy_count < min_load) {
-						min_load = thread[y].busy_count;
-						least_index = y;
-					}
-					y++;
+				make_nonblocking(new_client_fd);
+
+				struct epoll_event client_ev;
+				client_ev.events = EPOLLIN;
+				client_ev.data.fd = new_client_fd;
+				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
+			//handle old connections
+			} else {
+				int client_fd = fd;
+
+				char buf[4096];
+				int r = read(client_fd, buf, sizeof(buf));
+				if(r <= 0){
+					close(client_fd);
+					continue;
 				}
 
-				// Now assign client to the least busy worker
-				thread[least_index].que[thread[least_index].tail++] = client_fd;
-				thread[least_index].busy_count++;
+				HTTPRequest req;
+				int parsed = parse_request(&req, buf, r);
+				if(parsed > 0){
+					printf("method: %.*s, Path. %.*s\n",
+					(int)req.method_len, req.method,
+					(int)req.path_len, req.path);
+				} else if(parsed == -1){
+					printf("error while parsing\n");
+				} else {
+					printf("incomplete request\n");
+				}
+				process_client(client_fd, &req);
+				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+				close(client_fd);
 
-				uint64_t one = 1;
-				write(thread[least_index].ev_fd, &one, sizeof(one));
 			}
+
+
+			i++;
 		}
+
 	}
+	//port can now listen
+
+
+	return 0;
 }
