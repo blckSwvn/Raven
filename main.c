@@ -1,5 +1,5 @@
 #include "picohttpparser/picohttpparser.h"
-#include "arena.h"
+#include "arena/arena.h"
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <malloc.h> //remove later
@@ -67,16 +67,26 @@ int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
 }
 
 void *process_client(int fd, HTTPRequest *req){
-	char filepath[512];
+	const char *path = req->path;
+	size_t path_len = req->path_len;
+
+	size_t filepath_len = 512;
+	char *filepath = arena_alloc(filepath_len);
+	if(path_len > 0 && path[0] == '/'){
+		path++;
+		path_len--;
+	}
+
 	//builds fullpath
-	if(req->path_len == 1 && req->path[0] == '/') {
-		snprintf(filepath, sizeof(filepath), "../www/index.html");
-	} else if (req->path_len > 0 && req->path[req->path_len -1] == '/'){
-		snprintf(filepath, sizeof(filepath), "../www/%.*sindex.html",
-				(int)req->path_len, req->path);
+	if(path_len == 0) {
+		snprintf(filepath, filepath_len, "../www/index.html");
+	} else if (path[path_len -1] == '/'){
+		snprintf(filepath, filepath_len, "../www/%.*sindex.html",
+				(int)path_len, path);
 	} else {
-		snprintf(filepath, sizeof(filepath), "../www/%.*s",
-				(int)req->path_len, req->path);
+		snprintf(filepath, filepath_len, "../www/%.*s",
+				(int)path_len, path);
+		printf("filepath: %.*s\n", (int)path_len, path);
 	}
 
 	int f = open(filepath, O_RDONLY);
@@ -94,17 +104,19 @@ void *process_client(int fd, HTTPRequest *req){
 		} else {
 			struct stat st;
 			if (fstat(f404, &st) == 0) {
-				char header[256];
-				int hlen = snprintf(header, sizeof(header),
+				size_t header_len = 256;
+				char *header = arena_alloc(256);
+				int hlen = snprintf(header, header_len,
 						"HTTP/1.1 404 not found\r\n"
-						"Content-Type: text/html\r\n"
+						"Content-Type: text/plain\r\n"
 						"Content-Length: %jd\r\n\r\n",
 						(intmax_t)st.st_size);
 				send(fd, header, hlen, 0);
 
-				char buf2[4096];
+				size_t buf2_len = 4096;
+				char *buf2 = arena_alloc(buf2_len);
 				ssize_t r;
-				while ((r = read(f404, buf2, sizeof(buf2))) > 0) {
+				while ((r = read(f404, buf2, buf2_len)) > 0) {
 					send(fd, buf2, r, 0);
 				}
 			}
@@ -116,16 +128,18 @@ void *process_client(int fd, HTTPRequest *req){
 
 	struct stat st;
 	if(fstat(f, &st) == 0){
-		char header[256];
-		int hlen = snprintf(header, sizeof(header),
+		size_t header_len = 512;
+		char *header = arena_alloc(header_len);
+		int hlen = snprintf(header, header_len,
 				"HTTP/1.1 200 OK\r\n"
 				"Content-Type: text/html\r\n"
 				"Content-Length: %jd\r\n\r\n",
 				(intmax_t)st.st_size);
 		send(fd, header, hlen, 0);
-		char buf2[4096];
+		size_t buf2_len = 4096;
+		char *buf2 = arena_alloc(buf2_len);
 		ssize_t r;
-		while((r = read(f, buf2, sizeof(buf2))) > 0){
+		while((r = read(f, buf2, buf2_len)) > 0){
 			send(fd, buf2, r, 0);
 		}
 	}
@@ -178,6 +192,7 @@ int main(){
 	// 	i++;
 	// }
 
+	arena_init(1024 * 1024); //1MB
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
@@ -202,8 +217,9 @@ int main(){
 			} else {
 				int client_fd = fd;
 
-				char buf[4096];
-				int r = read(client_fd, buf, sizeof(buf));
+				size_t buf_len = 4096;
+				char *buf = arena_alloc(buf_len);
+				int r = read(client_fd, buf, buf_len);
 				if(r <= 0){
 					close(client_fd);
 					continue;
@@ -224,6 +240,7 @@ int main(){
 				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 				close(client_fd);
 
+				arena_reset();
 			}
 
 
@@ -234,5 +251,6 @@ int main(){
 	//port can now listen
 
 
+	arena_free();
 	return 0;
 }

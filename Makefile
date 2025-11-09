@@ -8,7 +8,7 @@ INCLUDES = -I./salloc -I./picohttpparser
 TARGET = main
 
 # Source files
-SRCS = main.c picohttpparser/picohttpparser.c arena.c
+SRCS = main.c picohttpparser/picohttpparser.c arena/arena.c
 OBJS = $(SRCS:.c=.o)
 
 # Default rule
