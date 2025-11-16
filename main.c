@@ -20,6 +20,28 @@ typedef struct {
 	size_t num_headers;
 } HTTPRequest;
 
+
+typedef struct {
+	const char *ext;
+	const char *mime;
+} mime_type;
+
+static const mime_type mime[] = {
+	{"html", "text/html"},
+	{"htm", "text/html"},
+	{"css", "text/css"},
+	{"js", "application/javascript"},
+	{"json", "application/json"},
+	{"png", "image/png"},
+	{"jpg", "image/jpeg"},
+	{"jpeg", "image/jpeg"},
+	{"gif", "image/gif"},
+	{"svg", "image/svg+xml"},
+	{"txt", "text/plain"},
+	{"md", "text/markdown"},
+	{NULL, "application/octet-stream"}
+};
+
 #define PORT 8080
 #define MAX_EVENTS 255
 
@@ -54,6 +76,22 @@ inline int make_nonblocking(int fd) {
 }
 
 
+const char *get_mime(const char *path){
+	const char *ext = strrchr(path, '.');
+	if(!ext || ext == path)return "text/plain";
+	ext++;
+	uint8_t i = 0;
+	//stops at 12 beeing {NULL, "application/octet-stream"}
+	while(mime[i].ext){
+		if(strcmp(ext, mime[i].ext) == 0){
+			return mime[i].mime;
+		}
+		i++;
+	}
+	return mime[i].mime; //aplication/octet-stream
+}
+
+
 int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
 	req->num_headers = 16;
 
@@ -66,6 +104,22 @@ int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
 	return pret; // >0 means sucess, -1 means error, -2 = incomplete
 }
 
+
+void build_path(char *filepath, const char *path, size_t path_len, size_t filepath_len){
+	if(path_len == 1 && path[0] == '/')
+		snprintf(filepath, filepath_len, "../www/index.html");
+	else{
+		snprintf(filepath, filepath_len, "../www/%.*s",
+				(int)path_len, path);
+		if(filepath[strlen(filepath) -1] == '/')
+			strncat(filepath, "index.html", filepath_len - strlen(filepath) - 1);
+		else if(access(filepath, F_OK) != 0){
+			strncat(filepath, ".html", filepath_len - strlen(filepath) - 1);
+		}
+	}
+}
+
+
 void *process_client(int fd, HTTPRequest *req){
 	const char *path = req->path;
 	size_t path_len = req->path_len;
@@ -77,17 +131,7 @@ void *process_client(int fd, HTTPRequest *req){
 		path_len--;
 	}
 
-	//builds fullpath
-	if(path_len == 0) {
-		snprintf(filepath, filepath_len, "../www/index.html");
-	} else if (path[path_len -1] == '/'){
-		snprintf(filepath, filepath_len, "../www/%.*sindex.html",
-				(int)path_len, path);
-	} else {
-		snprintf(filepath, filepath_len, "../www/%.*s",
-				(int)path_len, path);
-		printf("filepath: %.*s\n", (int)path_len, path);
-	}
+	build_path(filepath, path, path_len, filepath_len);
 
 	int f = open(filepath, O_RDONLY);
 	if(f < 0){
@@ -95,9 +139,8 @@ void *process_client(int fd, HTTPRequest *req){
 		if(f404 < 0){
 			const char *not_found =
 				"HTTP/1.1 404 Not Found\r\n"
-				"Content-Length: 13\r\n"
-				"Content-Type: text/html\r\n\r\n"
-				"404 Not Found";
+				"Content-Type: text/html\r\n"
+				"Content-Length: 13\r\n\r\n";
 			send(fd, not_found, strlen(not_found), 0);
 			shutdown(fd, SHUT_WR);
 			return NULL;
@@ -108,7 +151,7 @@ void *process_client(int fd, HTTPRequest *req){
 				char *header = arena_alloc(256);
 				int hlen = snprintf(header, header_len,
 						"HTTP/1.1 404 not found\r\n"
-						"Content-Type: text/plain\r\n"
+						"Content-Type: text/html\r\n"
 						"Content-Length: %jd\r\n\r\n",
 						(intmax_t)st.st_size);
 				send(fd, header, hlen, 0);
@@ -126,14 +169,16 @@ void *process_client(int fd, HTTPRequest *req){
 		}
 	}
 
+	const char *mime = get_mime(filepath);
 	struct stat st;
 	if(fstat(f, &st) == 0){
 		size_t header_len = 512;
 		char *header = arena_alloc(header_len);
 		int hlen = snprintf(header, header_len,
 				"HTTP/1.1 200 OK\r\n"
-				"Content-Type: text/html\r\n"
+				"Content-Type: %s\r\n"
 				"Content-Length: %jd\r\n\r\n",
+				mime,
 				(intmax_t)st.st_size);
 		send(fd, header, hlen, 0);
 		size_t buf2_len = 4096;
@@ -146,7 +191,6 @@ void *process_client(int fd, HTTPRequest *req){
 	close(f);
 	shutdown(fd, SHUT_WR);
 	return NULL;
-
 }
 
 
@@ -167,6 +211,7 @@ int main(){
 
 	if(bind(listen_fd,(struct sockaddr *)&adress, sizeof(adress)) < 0){
 		perror("binds failed");	
+		return 2;
 	}
 
 	listen(listen_fd, SOMAXCONN);
@@ -227,15 +272,6 @@ int main(){
 
 				HTTPRequest req;
 				int parsed = parse_request(&req, buf, r);
-				if(parsed > 0){
-					printf("method: %.*s, Path. %.*s\n",
-					(int)req.method_len, req.method,
-					(int)req.path_len, req.path);
-				} else if(parsed == -1){
-					printf("error while parsing\n");
-				} else {
-					printf("incomplete request\n");
-				}
 				process_client(client_fd, &req);
 				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 				close(client_fd);
