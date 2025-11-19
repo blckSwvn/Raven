@@ -1,8 +1,9 @@
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
+#include <string.h>
 #include <arpa/inet.h>
 #include <stdio.h>
-#include <malloc.h> //remove later
+#include <malloc.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -64,11 +65,6 @@ void get_mem(){
 }
 
 
-void *work(void *arg){
-	pthread_exit(NULL);
-}
-
-
 inline int make_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) return -1;
@@ -105,8 +101,15 @@ int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
 }
 
 
-void build_path(char *filepath, const char *path, size_t path_len, size_t filepath_len){
-	if(path_len == 1 && path[0] == '/')
+inline void *build_path(const char *path, size_t path_len, size_t filepath_len){
+	char *filepath = arena_alloc(filepath_len);
+
+	if(path_len > 0 && path[0] == '/'){
+		path++;
+		path_len--;
+	}
+
+	if(path_len == 0)
 		snprintf(filepath, filepath_len, "../www/index.html");
 	else{
 		snprintf(filepath, filepath_len, "../www/%.*s",
@@ -117,57 +120,56 @@ void build_path(char *filepath, const char *path, size_t path_len, size_t filepa
 			strncat(filepath, ".html", filepath_len - strlen(filepath) - 1);
 		}
 	}
+	return filepath;
+}
+
+
+inline void handle_file_not_found(int fd){
+	int f404 = open("../www/404.html", O_RDONLY);
+	if(f404 < 0){
+		const char *not_found =
+			"HTTP/1.1 404 Not Found\r\n"
+			"Content-Type: text/html\r\n"
+			"Content-Length: 13\r\n\r\n";
+		send(fd, not_found, strlen(not_found), 0);
+		shutdown(fd, SHUT_WR);
+		return;
+	} else {
+		struct stat st;
+		if (fstat(f404, &st) == 0) {
+			size_t header_len = 256;
+			char *header = arena_alloc(256);
+			int hlen = snprintf(header, header_len,
+					"HTTP/1.1 404 Not Found\r\n"
+					"Content-Type: text/html\r\n"
+					"Content-Length: %jd\r\n\r\n",
+					(intmax_t)st.st_size);
+			send(fd, header, hlen, 0);
+
+			size_t buf2_len = 4096;
+			char *buf2 = arena_alloc(buf2_len);
+			ssize_t r;
+			while ((r = read(f404, buf2, buf2_len)) > 0) {
+				send(fd, buf2, r, 0);
+			}
+		}
+		close(f404);
+		shutdown(fd, SHUT_WR);
+		return;
+	}
 }
 
 
 void *process_client(int fd, HTTPRequest *req){
 	const char *path = req->path;
 	size_t path_len = req->path_len;
-
 	size_t filepath_len = 512;
-	char *filepath = arena_alloc(filepath_len);
-	if(path_len > 0 && path[0] == '/'){
-		path++;
-		path_len--;
-	}
 
-	build_path(filepath, path, path_len, filepath_len);
+	char *filepath = build_path(path, path_len, filepath_len);
 
 	int f = open(filepath, O_RDONLY);
-	if(f < 0){
-		int f404 = open("../www/404.html", O_RDONLY);
-		if(f404 < 0){
-			const char *not_found =
-				"HTTP/1.1 404 Not Found\r\n"
-				"Content-Type: text/html\r\n"
-				"Content-Length: 13\r\n\r\n";
-			send(fd, not_found, strlen(not_found), 0);
-			shutdown(fd, SHUT_WR);
-			return NULL;
-		} else {
-			struct stat st;
-			if (fstat(f404, &st) == 0) {
-				size_t header_len = 256;
-				char *header = arena_alloc(256);
-				int hlen = snprintf(header, header_len,
-						"HTTP/1.1 404 not found\r\n"
-						"Content-Type: text/html\r\n"
-						"Content-Length: %jd\r\n\r\n",
-						(intmax_t)st.st_size);
-				send(fd, header, hlen, 0);
-
-				size_t buf2_len = 4096;
-				char *buf2 = arena_alloc(buf2_len);
-				ssize_t r;
-				while ((r = read(f404, buf2, buf2_len)) > 0) {
-					send(fd, buf2, r, 0);
-				}
-			}
-			close(f404);
-			shutdown(fd, SHUT_WR);
-			return NULL;
-		}
-	}
+	if(f < 0)
+		handle_file_not_found(fd);
 
 	const char *mime = get_mime(filepath);
 	struct stat st;
@@ -178,8 +180,7 @@ void *process_client(int fd, HTTPRequest *req){
 				"HTTP/1.1 200 OK\r\n"
 				"Content-Type: %s\r\n"
 				"Content-Length: %jd\r\n\r\n",
-				mime,
-				(intmax_t)st.st_size);
+				mime, (intmax_t)st.st_size);
 		send(fd, header, hlen, 0);
 		size_t buf2_len = 4096;
 		char *buf2 = arena_alloc(buf2_len);
@@ -229,14 +230,6 @@ int main(){
 
 	printf("server listenning on port %i\n", PORT);
 
-	//add multi threading later
-	// pthread_t worker[procs];
-	// uint i = 0;
-	// while(i < procs){
-	// 	pthread_create(&worker[i], NULL, work, NULL); 
-	// 	i++;
-	// }
-
 	arena_init(1024 * 1024); //1MB
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -258,7 +251,7 @@ int main(){
 				client_ev.events = EPOLLIN;
 				client_ev.data.fd = new_client_fd;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
-			//handle old connections
+				//handle old connections
 			} else {
 				int client_fd = fd;
 
@@ -284,9 +277,6 @@ int main(){
 		}
 
 	}
-	//port can now listen
-
-
 	arena_free();
 	return 0;
 }
