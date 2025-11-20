@@ -101,7 +101,7 @@ int parse_request(HTTPRequest *req, const char *buf, size_t buf_len){
 }
 
 
-inline void *build_path(const char *path, size_t path_len, size_t filepath_len){
+void *build_path(const char *path, size_t path_len, size_t filepath_len){
 	char *filepath = arena_alloc(filepath_len);
 
 	if(path_len > 0 && path[0] == '/'){
