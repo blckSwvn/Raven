@@ -1,5 +1,6 @@
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
+#include <stdint.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -21,6 +22,21 @@ typedef struct {
 	size_t num_headers;
 } HTTPRequest;
 
+struct l_conn {
+	int fd;
+	int listen;
+}; 
+
+#define MIN_BUF 8000 //8kb
+#define MAX_BUF 32000 //32kb
+
+struct conn {
+	int fd;
+	int keep_alive; //HTTP1.1 defauts to keep alive
+	void *buf;
+	uint16_t buf_length; //starts at MIN_BUF
+	uint16_t buf_used;
+};
 
 typedef struct {
 	const char *ext;
@@ -130,7 +146,8 @@ inline void handle_file_not_found(int fd){
 		const char *not_found =
 			"HTTP/1.1 404 Not Found\r\n"
 			"Content-Type: text/html\r\n"
-			"Content-Length: 13\r\n\r\n";
+			"Content-Length: 13\r\n"
+			"Connection: close\r\n\r\n";
 		send(fd, not_found, strlen(not_found), 0);
 		shutdown(fd, SHUT_WR);
 		return;
@@ -142,7 +159,8 @@ inline void handle_file_not_found(int fd){
 			int hlen = snprintf(header, header_len,
 					"HTTP/1.1 404 Not Found\r\n"
 					"Content-Type: text/html\r\n"
-					"Content-Length: %jd\r\n\r\n",
+					"Content-Length: %jd\r\n"
+					"Connection: keep-alive\r\n\r\n",
 					(intmax_t)st.st_size);
 			send(fd, header, hlen, 0);
 
@@ -179,7 +197,8 @@ void *process_client(int fd, HTTPRequest *req){
 		int hlen = snprintf(header, header_len,
 				"HTTP/1.1 200 OK\r\n"
 				"Content-Type: %s\r\n"
-				"Content-Length: %jd\r\n\r\n",
+				"Content-Length: %jd\r\n"
+				"Connection: keep-alive\r\n\r\n",
 				mime, (intmax_t)st.st_size);
 		send(fd, header, hlen, 0);
 		size_t buf2_len = 4096;
@@ -189,8 +208,8 @@ void *process_client(int fd, HTTPRequest *req){
 			send(fd, buf2, r, 0);
 		}
 	}
-	close(f);
-	shutdown(fd, SHUT_WR);
+	// close(f);
+	// shutdown(fd, SHUT_WR);
 	return NULL;
 }
 
@@ -222,8 +241,12 @@ int main(){
 	int epoll_fd = epoll_create1(0);
 
 	struct epoll_event ev;
+	struct l_conn *data = malloc(sizeof(struct l_conn));
+	data->listen = -2;
+	data->fd = listen_fd;
+
 	ev.events = EPOLLIN;
-	ev.data.fd = listen_fd;
+	ev.data.ptr = data;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 
 	struct epoll_event events[MAX_EVENTS];
@@ -236,44 +259,70 @@ int main(){
 
 		int i = 0;
 		while(wait > i){
-			int fd = events[i].data.fd;
-			//register new client
-			struct sockaddr_in client_addr;
-			socklen_t client_len = sizeof(client_addr);
-			if(fd == listen_fd){
-				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
+			struct l_conn *listen_data = events[i].data.ptr;
+			if(listen_data->listen == -2){
+				int fd = listen_data->fd;
 
-				if(new_client_fd < 0)continue;
+				//register new client
+				struct sockaddr_in client_addr;
+				socklen_t client_len = sizeof(client_addr);
+					printf("handling new client\n");
+					int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
 
-				make_nonblocking(new_client_fd);
+					if(new_client_fd < 0)continue;
 
-				struct epoll_event client_ev;
-				client_ev.events = EPOLLIN;
-				client_ev.data.fd = new_client_fd;
-				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
+					make_nonblocking(new_client_fd);
+
+					struct epoll_event client_ev;
+					client_ev.events = EPOLLIN;
+
+					struct conn *new_conn = malloc(sizeof(struct conn));
+					new_conn->fd = new_client_fd;
+					new_conn->buf_length = MIN_BUF;
+					new_conn->buf = malloc(MIN_BUF);
+					new_conn->buf_used = 0;
+					new_conn->keep_alive = 1;
+
+					client_ev.data.ptr = new_conn;
+					epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
 				//handle old connections
 			} else {
-				int client_fd = fd;
+				// printf("handling old clients\n");
+				struct conn *client = events[i].data.ptr;
+				int client_fd = client->fd;
 
-				size_t buf_len = 4096;
-				char *buf = arena_alloc(buf_len);
-				int r = read(client_fd, buf, buf_len);
-				if(r <= 0){
+				int r = read(client_fd, client->buf, client->buf_length);
+				client->buf_used += r;
+				if(r > 0){
+					client->buf_used += r;
+				} else if (r == 0){
+					//client closed conn
+				} else {
+					free(client->buf);
 					close(client_fd);
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 					continue;
-				}
+				} 
 
 				HTTPRequest req;
-				int parsed = parse_request(&req, buf, r);
-				process_client(client_fd, &req);
-				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-				close(client_fd);
 
-				arena_reset();
+				// >0 means sucess, -1 means error, -2 = incomplete
+				int parsed = parse_request(&req, client->buf, client->buf_used);
+				printf("parsed:%d\n",parsed);
+				if(parsed > 0){
+					process_client(client_fd, &req);
+					memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
+					client->buf_used -= parsed;
+
+				} else if(parsed == -1){
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+					close(client_fd);
+					free(client->buf);
+				}
+
 			}
-
-
 			i++;
+			printf("i:%d\n",i);
 		}
 
 	}
