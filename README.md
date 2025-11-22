@@ -10,8 +10,13 @@ may be reused for a mail server
 
 replace read with sendfile
 worker threads
-keep alive connections
+keep alive connections(working on currently)
+use useragent to determine http version
+then decide on Connection: like keep alive or close imediately
+also need timeout to prevent ppl holding onto sockets forever
+pool struct conn add them to a linked list rather than freeing
+
 logging
-UDP for video
-keeping files except video and images in ram to avoid constant IO
+UDP for video(maybe)
+caching pages like html, css, js, SVGs except vidoes and images to avoid IO
 
