@@ -32,7 +32,7 @@ struct l_conn {
 
 struct conn {
 	int fd;
-	int keep_alive; //HTTP1.1 defauts to keep alive
+	// int keep_alive; //HTTP1.1 defauts to keep alive
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
@@ -289,7 +289,6 @@ int main(){
 				new_conn->buf_length = MIN_BUF;
 				new_conn->buf = malloc(MIN_BUF);
 				new_conn->buf_used = 0;
-				new_conn->keep_alive = 1;
 
 				client_ev.data.ptr = new_conn;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
