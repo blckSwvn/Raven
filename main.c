@@ -247,9 +247,11 @@ int main(){
 
 	int epoll_fd = epoll_create1(0);
 
+#define magic_l_val -1
+
 	struct epoll_event ev;
 	struct l_conn *data = malloc(sizeof(struct l_conn));
-	data->listen = -2;
+	data->listen = magic_l_val;
 	data->fd = listen_fd;
 
 	ev.events = EPOLLIN;
@@ -267,7 +269,7 @@ int main(){
 		int i = 0;
 		while(wait > i){
 			struct l_conn *listen_data = events[i].data.ptr;
-			if(listen_data->listen == -2){
+			if(listen_data->listen == magic_l_val){
 
 				//register new client
 				struct sockaddr_in client_addr;
