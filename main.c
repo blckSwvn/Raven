@@ -36,6 +36,7 @@ struct conn {
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
+	void *next;
 };
 
 typedef struct {
@@ -225,7 +226,6 @@ int main(){
 	get_threads();
 	get_mem();
 
-
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0){
@@ -262,6 +262,7 @@ int main(){
 
 	printf("server listenning on port %i\n", PORT);
 
+	void *conn_list = NULL;
 	arena_init(1024 * 1024); //1MB
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -284,11 +285,21 @@ int main(){
 				struct epoll_event client_ev;
 				client_ev.events = EPOLLIN;
 
-				struct conn *new_conn = malloc(sizeof(struct conn));
-				new_conn->fd = new_client_fd;
-				new_conn->buf_length = MIN_BUF;
-				new_conn->buf = malloc(MIN_BUF);
-				new_conn->buf_used = 0;
+				struct conn *new_conn;
+				if(conn_list){
+					new_conn = conn_list;
+					new_conn->fd = new_client_fd;
+					new_conn->buf_length = MIN_BUF;
+					new_conn->buf = malloc(MIN_BUF);
+					conn_list = new_conn->next;
+					new_conn->buf_used = 0;
+				} else {
+					new_conn = malloc(sizeof(struct conn));
+					new_conn->fd = new_client_fd;
+					new_conn->buf_length = MIN_BUF;
+					new_conn->buf = malloc(MIN_BUF);
+					new_conn->buf_used = 0;
+				}
 
 				client_ev.data.ptr = new_conn;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
@@ -310,7 +321,8 @@ int main(){
 					close(client_fd);
 					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
-					free(client);
+					client->next = conn_list;
+					conn_list = client;
 					continue;
 				} 
 
@@ -326,7 +338,8 @@ int main(){
 						close(client_fd);
 						shutdown(client_fd, SHUT_WR);
 						free(client->buf);
-						free(client);
+						client->next = conn_list;
+						conn_list = client;
 					} else {
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
@@ -349,7 +362,8 @@ int main(){
 					close(client_fd);
 					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
-					free(client);
+					client->next = conn_list;
+					conn_list = client;
 				}
 			}
 			i++;
@@ -357,5 +371,12 @@ int main(){
 
 	}
 	arena_free();
+
+	while(conn_list){
+		struct conn *next = conn_list;
+		next = next->next;
+		free(conn_list);
+		conn_list = next;
+	}
 	return 0;
 }
