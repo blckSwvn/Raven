@@ -190,12 +190,21 @@ const char *process_client(int fd, HTTPRequest *req){
 		return "close";
 	}
 
-	char *connection;
+	char *connection = "close";
 	if(req->minor_version){
-		if(strncmp(req->headers[6].value, "close", 5) != 0)
-			connection = "keep-alive";
-		else connection = "close";
-	}else connection = "close";
+		size_t i = 2;
+		while(i < req->num_headers){
+			if(strncmp(req->headers[i].name, "Connection", 10) == 0){
+				if(strncmp(req->headers[i].value, "close", 5) != 0){
+					connection = "keep-alive";
+				} else {
+					connection = "close";
+				}
+				break;
+			}
+			i++;
+		}
+	}
 
 	const char *mime = get_mime(filepath);
 	struct stat st;
