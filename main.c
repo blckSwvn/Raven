@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <time.h>
+#include <sys/timerfd.h>
 
 typedef struct {
 	const char *method;
@@ -36,6 +38,7 @@ struct conn {
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
+	time_t last_active;
 	void *next;
 };
 
@@ -267,117 +270,166 @@ int main(){
 	ev.data.ptr = data;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 
+	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+	struct itimerspec its;
+	its.it_interval.tv_sec = 10;
+	its.it_interval.tv_nsec = 0;
+	its.it_value.tv_sec = 1;
+	its.it_value.tv_nsec = 0;
+	timerfd_settime(tfd, 0, &its, NULL);
+
+#define magic_t_val -2
+
+	struct epoll_event timer_ev;
+	struct l_conn *tdata = malloc(sizeof(struct l_conn));
+	tdata->listen = magic_t_val;
+	tdata->fd = tfd;
+
+	timer_ev.events = EPOLLIN;
+	timer_ev.data.ptr = tdata;
+	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tfd, &timer_ev);
+
+
 	struct epoll_event events[MAX_EVENTS];
 
 	printf("server listenning on port %i\n", PORT);
 
 	void *conn_list = NULL;
 	arena_init(1024 * 1024); //1MB
+				 //
+#define TIMEOUT_SECONDS 10
+
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
 		int i = 0;
-		while(wait > i){
-			struct l_conn *listen_data = events[i].data.ptr;
-			if(listen_data->listen == magic_l_val){
-
-				//register new client
-				struct sockaddr_in client_addr;
-				socklen_t client_len = sizeof(client_addr);
-				printf("handling new client\n");
-				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
-
-				if(new_client_fd < 0)continue;
-
-				make_nonblocking(new_client_fd);
-
-				struct epoll_event client_ev;
-				client_ev.events = EPOLLIN;
-
-				struct conn *new_conn;
-				if(conn_list){
-					new_conn = conn_list;
-					new_conn->fd = new_client_fd;
-					new_conn->buf_length = MIN_BUF;
-					new_conn->buf = malloc(MIN_BUF);
-					conn_list = new_conn->next;
-					new_conn->buf_used = 0;
-				} else {
-					new_conn = malloc(sizeof(struct conn));
-					new_conn->fd = new_client_fd;
-					new_conn->buf_length = MIN_BUF;
-					new_conn->buf = malloc(MIN_BUF);
-					new_conn->buf_used = 0;
-				}
-
-				client_ev.data.ptr = new_conn;
-				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
-				//handle old connections
-			} else {
-				// printf("handling old clients\n");
-				struct conn *client = events[i].data.ptr;
-				int client_fd = client->fd;
-
-				int r = read(client_fd,
-						client->buf + client->buf_used,
-						client->buf_length - client->buf_used);
-				if(r > 0){
-					client->buf_used += r;
-				} else if (r == 0){
-					//client closed conn
-				} else {
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-					close(client_fd);
-					shutdown(client_fd, SHUT_WR);
+		struct l_conn *t_data = events[i].data.ptr;
+		if(t_data->listen == magic_t_val){
+			printf("pruning old client\n");
+			uint64_t experation;
+			read(tfd, &experation, sizeof(experation));
+			time_t now = time(NULL);
+			struct conn *pp = conn_list;
+			while(pp) {
+				struct conn *client = pp;
+				if (now - client->last_active > TIMEOUT_SECONDS) {
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+					close(client->fd);
 					free(client->buf);
+					// remove from list
+					pp = client->next;
 					client->next = conn_list;
 					conn_list = client;
-					continue;
-				} 
+				} else {
+					pp = client->next;
+				}
+			}
+		} else {
+			while(wait > i){
+				struct l_conn *listen_data = events[i].data.ptr;
+				if(listen_data->listen == magic_l_val && listen_data->listen != magic_t_val){
 
-				HTTPRequest req;
+					//register new client
+					struct sockaddr_in client_addr;
+					socklen_t client_len = sizeof(client_addr);
+					printf("handling new client\n");
+					int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
 
-				// >0 means sucess, -1 means error, -2 = incomplete
-				int parsed = parse_request(&req, client->buf, client->buf_used);
-				// printf("parsed:%d\n",parsed);
-				if(parsed > 0){
-					const char *connection = process_client(client_fd, &req);
-					if(strncmp(connection, "close", 1)){
+					if(new_client_fd < 0)continue;
+
+					make_nonblocking(new_client_fd);
+
+					struct epoll_event client_ev;
+					client_ev.events = EPOLLIN;
+
+					struct conn *new_conn;
+					if(conn_list){
+						new_conn = conn_list;
+						new_conn->fd = new_client_fd;
+						new_conn->buf_length = MIN_BUF;
+						new_conn->buf = malloc(MIN_BUF);
+						conn_list = new_conn->next;
+						new_conn->buf_used = 0;
+						new_conn->last_active = time(NULL);
+					} else {
+						new_conn = malloc(sizeof(struct conn));
+						new_conn->fd = new_client_fd;
+						new_conn->buf_length = MIN_BUF;
+						new_conn->buf = malloc(MIN_BUF);
+						new_conn->buf_used = 0;
+						new_conn->last_active = time(NULL);
+					}
+
+					client_ev.data.ptr = new_conn;
+					epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
+					//handle old connections
+				} else {
+					// printf("handling old clients\n");
+					struct conn *client = events[i].data.ptr;
+					int client_fd = client->fd;
+
+					int r = read(client_fd,
+							client->buf + client->buf_used,
+							client->buf_length - client->buf_used);
+					if(r > 0){
+						client->buf_used += r;
+						client->last_active = time(NULL);
+					} else if (r == 0){
+						//client closed conn
+					} else {
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 						close(client_fd);
 						shutdown(client_fd, SHUT_WR);
 						free(client->buf);
 						client->next = conn_list;
 						conn_list = client;
-					} else {
-						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
-						client->buf_used -= parsed;
-						printf("minor:%d\n", req.minor_version);
-						uint n = 0;
-						while(n < req.num_headers){
-							printf("phr_headers: %d\n",n);
-							printf("name:%.*s\n",
-									(uint)req.headers[n].name_len, req.headers[n].name);
-							printf("%.*s\n",
-									(uint)req.headers[n].value_len, req.headers[n].value);
+						continue;
+					} 
 
-							printf("\n");
-							n++;
+					HTTPRequest req;
+
+					// >0 means sucess, -1 means error, -2 = incomplete
+					int parsed = parse_request(&req, client->buf, client->buf_used);
+					// printf("parsed:%d\n",parsed);
+					if(parsed > 0){
+						const char *connection = process_client(client_fd, &req);
+						if(strncmp(connection, "close", 1)){
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+							close(client_fd);
+							shutdown(client_fd, SHUT_WR);
+							free(client->buf);
+							client->next = conn_list;
+							conn_list = client;
+						} else {
+							memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
+							client->buf_used -= parsed;
+							printf("minor:%d\n", req.minor_version);
+							uint n = 0;
+							while(n < req.num_headers){
+								printf("phr_headers: %d\n",n);
+								printf("name:%.*s\n",
+										(uint)req.headers[n].name_len, req.headers[n].name);
+								printf("%.*s\n",
+										(uint)req.headers[n].value_len, req.headers[n].value);
+
+								printf("\n");
+								n++;
+							}
 						}
+
+					} else if(parsed == -1){
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+						close(client_fd);
+						shutdown(client_fd, SHUT_WR);
+						free(client->buf);
+						client->next = conn_list;
+						conn_list = client;
 					}
-
-				} else if(parsed == -1){
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-					close(client_fd);
-					shutdown(client_fd, SHUT_WR);
-					free(client->buf);
-					client->next = conn_list;
-					conn_list = client;
 				}
+				i++;
 			}
-			i++;
-		}
 
+		}
 	}
 	arena_free();
 
