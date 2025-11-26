@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 
+#define DEBUG 1
+
 typedef struct {
 	const char *method;
 	size_t method_len;
@@ -36,8 +38,8 @@ struct conn {
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
-	void *next;
-	void *prev;
+	struct conn *next;
+	struct conn *prev;
 };
 
 typedef struct {
@@ -231,6 +233,47 @@ const char *process_client(int fd, HTTPRequest *req){
 	return connection;
 }
 
+#ifdef DEBUG
+void dump_list(void *list){
+	struct conn *client = NULL;
+	if(list)client = list;
+
+	printf("list:%p\n",list);
+	while(client){
+		printf("%p\n", client);
+		printf("next:%p\n", client->next);
+		printf("prev:%p\n", client->prev);
+		client = client->next;
+	}
+	printf("\n");
+}
+#endif
+
+void rm_from_list(struct conn *client, void **list){
+	printf("rm_from_list\n");
+	if(client->next)client->next->prev = client->prev;
+	if(client->prev)client->prev->next = client->next;
+	if(*list == client)*list = client->next;
+
+	client->next = NULL;
+	client->prev = NULL;
+	dump_list(*list);
+}
+
+void add_to_list(struct conn *client, void **list){
+	printf("add_to_list\n");
+	if(*list){
+		struct conn *head = *list;
+		client->next = head;
+		head->prev = client;
+	} else	{
+		client->next = NULL;
+	}
+
+	client->prev = NULL;
+	*list = client;
+	dump_list(*list);
+}
 
 int main(){
 	get_threads();
@@ -272,8 +315,8 @@ int main(){
 
 	printf("server listenning on port %i\n", PORT);
 
-	void *conn_list = NULL;
-	void *active_conn_list = NULL;
+	void *inactive_list = NULL;
+	void *active_list = NULL;
 	arena_init(1024 * 1024); //1MB
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -296,25 +339,26 @@ int main(){
 				client_ev.events = EPOLLIN;
 
 				struct conn *new_conn;
-				if(conn_list){
-					new_conn = conn_list;
+				if(inactive_list){
+					printf("inactive_list\n");
+					new_conn = inactive_list;
+					rm_from_list(new_conn, &inactive_list);
+					add_to_list(new_conn, &active_list);
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
 					new_conn->buf = malloc(MIN_BUF);
-					conn_list = new_conn->next;
-					new_conn->next = active_conn_list ? active_conn_list : NULL;
-					new_conn->prev = NULL;
-					active_conn_list = new_conn;
 					new_conn->buf_used = 0;
 				} else {
+					printf("!inactive_list\n");
 					new_conn = malloc(sizeof(struct conn));
+					printf("new_conn:%p\n", new_conn);
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
 					new_conn->buf = malloc(MIN_BUF);
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
-					active_conn_list = new_conn;
 					new_conn->buf_used = 0;
+					add_to_list(new_conn, &active_list);
 				}
 
 				client_ev.data.ptr = new_conn;
@@ -336,8 +380,6 @@ int main(){
 					close(client_fd);
 					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
-					client->next = conn_list;
-					conn_list = client;
 					continue;
 				} 
 
@@ -347,18 +389,13 @@ int main(){
 				int parsed = parse_request(&req, client->buf, client->buf_used);
 				if(parsed > 0){
 					const char *connection = process_client(client_fd, &req);
-					if(strncmp(connection, "close", 1)){
+					if(strncmp(connection, "close", 1) != 0){
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 						close(client_fd);
 						shutdown(client_fd, SHUT_WR);
 						free(client->buf);
-						struct conn *prev_client = client->prev;
-						if(prev_client)prev_client->next = client->next;
-						struct conn *head = conn_list;
-						if(head)head->prev = client;
-						client->prev = NULL;
-						client->next = conn_list;
-						conn_list = client;
+						rm_from_list(client, &active_list);
+						add_to_list(client, &inactive_list);
 					} else {
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
@@ -369,13 +406,8 @@ int main(){
 					close(client_fd);
 					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
-					struct conn *prev_client = client->prev;
-					if(prev_client) prev_client->next = client->next;
-					client->prev = NULL;
-					struct conn *head = conn_list;
-					if(head)head->prev = client;
-					client->next = conn_list;
-					conn_list = client;
+					rm_from_list(client, &active_list);
+					add_to_list(client, &inactive_list);
 				}
 			}
 			i++;
@@ -384,12 +416,6 @@ int main(){
 	}
 	arena_free();
 
-	while(conn_list){
-		struct conn *next = conn_list;
-		next = next->next;
-		free(conn_list);
-		conn_list = next;
-	}
 	return 0;
 }
 
