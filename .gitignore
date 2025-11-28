@@ -1,4 +1,6 @@
 /compile_commands.json
 *.o
+arena/*.o
+picohttpparser/*.o
 main
 .cache
