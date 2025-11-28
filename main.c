@@ -1,6 +1,8 @@
+#include "bits/time.h"
 #include "bits/types/struct_itimerspec.h"
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
+#include "time.h"
 #include <sys/timerfd.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -278,6 +280,26 @@ void add_to_list(struct conn *client, void **list){
 	dump_list(*list);
 }
 
+void update_timer(int tfd, struct conn *curr, void **active_list){
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint64_t now = ts.tv_sec;
+
+	struct conn *head = *active_list;
+	if(curr->time < head->time){
+		rm_from_list(curr, *active_list);
+		add_to_list(curr, *active_list);
+		head = *active_list;
+	}
+
+	time_t soonest = head->time - ts.tv_sec;
+
+	struct itimerspec its;
+	its.it_value.tv_sec = soonest;
+	its.it_value.tv_nsec = 0;
+	timerfd_settime(tfd, 0, &its, NULL);
+}
+
 int main(){
 	// get_threads();
 	// get_mem();
@@ -325,11 +347,6 @@ int main(){
 	tev.data.ptr = timer; 
 
 	struct itimerspec its = {0};
-	its.it_value.tv_sec = 10;
-	its.it_value.tv_nsec = 0;
-
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
 
 	timerfd_settime(tfd, 0, &its, NULL);
 
@@ -364,7 +381,6 @@ int main(){
 				} else {
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 					close(client_fd);
-					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
 					continue;
 				} 
@@ -376,21 +392,23 @@ int main(){
 				if(parsed > 0){
 					const char *connection = process_client(client_fd, &req);
 					if(strcmp(connection, "close") == 0){
+						printf("close\n");
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 						close(client_fd);
-						shutdown(client_fd, SHUT_WR);
 						free(client->buf);
 						rm_from_list(client, &active_list);
 						add_to_list(client, &inactive_list);
 					} else {
+						printf("keep-alive\n");
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
+						update_timer(tfd, client, &active_list);
 					}
 
 				} else if(parsed == -1){
+					printf("close");
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 					close(client_fd);
-					shutdown(client_fd, SHUT_WR);
 					free(client->buf);
 					rm_from_list(client, &active_list);
 					add_to_list(client, &inactive_list);
@@ -415,7 +433,6 @@ int main(){
 					printf("inactive_list\n");
 					new_conn = inactive_list;
 					rm_from_list(new_conn, &inactive_list);
-					add_to_list(new_conn, &active_list);
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
 					new_conn->buf = malloc(MIN_BUF);
@@ -432,15 +449,13 @@ int main(){
 					new_conn->prev = NULL;
 					new_conn->buf_used = 0;
 					new_conn->time = ts.tv_sec + 10;
-					add_to_list(new_conn, &active_list);
 				}
+				add_to_list(new_conn, &active_list);
 
 				client_ev.data.ptr = new_conn;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
 			} else if(listen_data->listen == magic_t_val){
-#ifdef DEBUG
 				printf("magic_t_val\n");
-#endif
 				uint64_t experation;
 				read(tfd, &experation, sizeof experation);
 
@@ -461,8 +476,6 @@ int main(){
 					curr = next;
 				}
 				struct itimerspec its = {0};
-				its.it_value.tv_sec = 10;
-				its.it_value.tv_nsec = 0;
 				timerfd_settime(listen_data->fd, 0, &its, NULL);
 			}
 			i++;
