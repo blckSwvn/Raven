@@ -238,6 +238,29 @@ const char *process_client(int fd, HTTPRequest *req){
 	return connection;
 }
 
+
+
+void *inactive_list = NULL;
+
+void *active_head = NULL;
+void *active_tail = NULL;
+
+void update_timer(int tfd){
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint64_t now = ts.tv_sec;
+
+	struct conn *head = active_head;
+	printf("active_head:%p\n", active_head);
+
+	time_t soonest = head->time - ts.tv_sec;
+
+	struct itimerspec its;
+	its.it_value.tv_sec = soonest;
+	its.it_value.tv_nsec = 0;
+	timerfd_settime(tfd, 0, &its, NULL);
+}
+
 #ifdef DEBUG
 void dump_list(void *list){
 	struct conn *client = NULL;
@@ -254,51 +277,52 @@ void dump_list(void *list){
 }
 #endif
 
-void rm_from_list(struct conn *client, void **list){
-	printf("rm_from_list\n");
+
+inline void append_active(struct conn *client){
+#ifdef DEBUG
+	printf("appeand_active\n");
+#endif
+	if(active_tail){
+		struct conn *last = active_tail;
+		last->next = client;
+		client->prev = last;
+	} else {
+		client->prev = NULL;
+	}
+	client->next = NULL;
+	active_tail = client;
+	if(!active_head)active_head = active_tail;
+
+	dump_list(active_head);
+}
+
+
+inline void rm_active(struct conn *client){
+#ifdef DEBUG
+	printf("rm_active\n");
+#endif
+	if(active_head == client)
+		active_head = client->next;
+	if(active_tail == client)
+		active_tail = client->prev;
 	if(client->next)client->next->prev = client->prev;
 	if(client->prev)client->prev->next = client->next;
-	if(*list == client)*list = client->next;
-
 	client->next = NULL;
 	client->prev = NULL;
-	dump_list(*list);
+	dump_list(active_head);
 }
 
-void add_to_list(struct conn *client, void **list){
-	printf("add_to_list\n");
-	if(*list){
-		struct conn *head = *list;
-		client->next = head;
-		head->prev = client;
-	} else	{
-		client->next = NULL;
-	}
 
-	client->prev = NULL;
-	*list = client;
-	dump_list(*list);
+inline void insert_inactive(struct conn *client){
+#ifdef DEBUG
+	printf("insert_inactive\n");
+#endif
+	client->next = inactive_list;
+	inactive_list = client;
+	dump_list(inactive_list);
 }
 
-void update_timer(int tfd, struct conn *curr, void **active_list){
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	uint64_t now = ts.tv_sec;
 
-	struct conn *head = *active_list;
-	if(curr->time < head->time){
-		rm_from_list(curr, *active_list);
-		add_to_list(curr, *active_list);
-		head = *active_list;
-	}
-
-	time_t soonest = head->time - ts.tv_sec;
-
-	struct itimerspec its;
-	its.it_value.tv_sec = soonest;
-	its.it_value.tv_nsec = 0;
-	timerfd_settime(tfd, 0, &its, NULL);
-}
 
 int main(){
 	// get_threads();
@@ -354,8 +378,6 @@ int main(){
 
 	printf("server listenning on port %i\n", PORT);
 
-	void *inactive_list = NULL;
-	void *active_list = NULL;
 	arena_init(1024 * 1024); //1MB
 	while(1){
 		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -381,7 +403,6 @@ int main(){
 				} else {
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 					close(client_fd);
-					free(client->buf);
 					continue;
 				} 
 
@@ -395,23 +416,22 @@ int main(){
 						printf("close\n");
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 						close(client_fd);
-						free(client->buf);
-						rm_from_list(client, &active_list);
-						add_to_list(client, &inactive_list);
+						rm_active(client);
+						insert_inactive(client);
 					} else {
 						printf("keep-alive\n");
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
-						update_timer(tfd, client, &active_list);
+						append_active(client);
+						update_timer(tfd);
 					}
 
 				} else if(parsed == -1){
 					printf("close");
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 					close(client_fd);
-					free(client->buf);
-					rm_from_list(client, &active_list);
-					add_to_list(client, &inactive_list);
+					rm_active(client);
+					insert_inactive(client);
 				}
 			} else if(listen_data->listen == magic_l_val){
 
@@ -432,10 +452,9 @@ int main(){
 				if(inactive_list){
 					printf("inactive_list\n");
 					new_conn = inactive_list;
-					rm_from_list(new_conn, &inactive_list);
+					inactive_list = new_conn->next;
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
-					new_conn->buf = malloc(MIN_BUF);
 					new_conn->buf_used = 0;
 					new_conn->time = ts.tv_sec + 10;
 				} else {
@@ -450,7 +469,7 @@ int main(){
 					new_conn->buf_used = 0;
 					new_conn->time = ts.tv_sec + 10;
 				}
-				add_to_list(new_conn, &active_list);
+				append_active(new_conn);
 
 				client_ev.data.ptr = new_conn;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
@@ -462,16 +481,15 @@ int main(){
 				struct timespec now;
 				clock_gettime(CLOCK_MONOTONIC, &now);
 
-				struct conn *curr = active_list;
+				struct conn *curr = active_head;
 
 				while(curr){
 					struct conn *next = curr->next;
 					if(curr->time <= now.tv_sec){
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr->fd, NULL);
 						close(curr->fd);
-						free(curr->buf);
-						rm_from_list(curr, &active_list);
-						add_to_list(curr, &inactive_list);
+						rm_active(curr);
+						insert_inactive(curr);
 					}
 					curr = next;
 				}
@@ -485,3 +503,4 @@ int main(){
 	arena_free();
 	return 0;
 }
+
