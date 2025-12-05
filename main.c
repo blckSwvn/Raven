@@ -1,4 +1,5 @@
 #include "bits/time.h"
+#include <sys/errno.h>
 #include "bits/types/struct_itimerspec.h"
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
@@ -252,19 +253,19 @@ void update_timer(int tfd){
 
 	struct conn *head = active_head;
 	printf("active_head:%p\n", active_head);
+	printf("active_tail:%p\n", active_tail);
+	printf("inactive_list:%p\n", inactive_list);
 
 	time_t soonest = head->time - ts.tv_sec;
 
-	struct itimerspec its;
+	struct itimerspec its = {0};
 	its.it_value.tv_sec = soonest;
-	its.it_value.tv_nsec = 0;
 	timerfd_settime(tfd, 0, &its, NULL);
 }
 
 #ifdef DEBUG
 void dump_list(void *list){
-	struct conn *client = NULL;
-	if(list)client = list;
+	struct conn *client = list;
 
 	printf("list:%p\n",list);
 	while(client){
@@ -278,26 +279,25 @@ void dump_list(void *list){
 #endif
 
 
-inline void append_active(struct conn *client){
+static inline void append_active(struct conn *client){
 #ifdef DEBUG
 	printf("appeand_active\n");
 #endif
+	client->next = NULL;
+	client->prev = active_tail;
 	if(active_tail){
 		struct conn *last = active_tail;
 		last->next = client;
-		client->prev = last;
 	} else {
-		client->prev = NULL;
+		active_head = client;
 	}
-	client->next = NULL;
 	active_tail = client;
-	if(!active_head)active_head = active_tail;
 
 	dump_list(active_head);
 }
 
 
-inline void rm_active(struct conn *client){
+static inline void rm_active(struct conn *client){
 #ifdef DEBUG
 	printf("rm_active\n");
 #endif
@@ -313,7 +313,7 @@ inline void rm_active(struct conn *client){
 }
 
 
-inline void insert_inactive(struct conn *client){
+static inline void insert_inactive(struct conn *client){
 #ifdef DEBUG
 	printf("insert_inactive\n");
 #endif
@@ -323,11 +323,7 @@ inline void insert_inactive(struct conn *client){
 }
 
 
-
 int main(){
-	// get_threads();
-	// get_mem();
-
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0){
@@ -355,7 +351,7 @@ int main(){
 	data->listen = magic_l_val;
 	data->fd = listen_fd;
 
-	ev.events = EPOLLIN;
+	ev.events = EPOLLIN | EPOLLET;
 	ev.data.ptr = data;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 
@@ -387,49 +383,64 @@ int main(){
 			struct l_conn *listen_data = events[i].data.ptr;
 			if(listen_data->listen != magic_l_val && listen_data->listen != magic_t_val){
 				struct conn *client = events[i].data.ptr;
-				int client_fd = client->fd;
 
-				int r = read(client_fd,
-						client->buf + client->buf_used,
-						client->buf_length - client->buf_used);
-				if(r > 0){
-					client->buf_used += r;
-
-					struct timespec ts;
-					clock_gettime(CLOCK_MONOTONIC, &ts);
-					client->time = ts.tv_sec + 5; //resets time to current + 5 seconds
-				} else if (r == 0){
-					//client closed conn
-				} else {
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-					close(client_fd);
-					continue;
-				} 
+				while(1){
+					int r = read(client->fd,
+							client->buf + client->buf_used,
+							client->buf_length - client->buf_used);
+					if(r > 0){
+						client->buf_used += r;
+					} else if (r == 0){
+						//client closed conn
+						printf("client closed conn\n");
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL,client->fd, NULL);
+						close(client->fd);
+						client->fd = -1;
+						rm_active(client);
+						insert_inactive(client);
+					} else {
+						if(errno == EAGAIN || errno == EWOULDBLOCK){
+							printf("errno == EAGAIN\n");
+							break;
+						}
+						else{
+							printf("fatal error\n");
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+							close(client->fd);
+							client->fd = -1;
+							rm_active(client);
+							insert_inactive(client);
+						}
+					} 
+				}
 
 				HTTPRequest req;
 
 				// >0 means sucess, -1 means error, -2 = incomplete
-				int parsed = parse_request(&req, client->buf, client->buf_used);
+				int parsed;
+				if(client->fd){
+					parsed = parse_request(&req, client->buf, client->buf_used);
+				}
 				if(parsed > 0){
-					const char *connection = process_client(client_fd, &req);
+					const char *connection = process_client(client->fd, &req);
 					if(strcmp(connection, "close") == 0){
 						printf("close\n");
-						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-						close(client_fd);
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+						close(client->fd);
 						rm_active(client);
 						insert_inactive(client);
 					} else {
 						printf("keep-alive\n");
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
-						append_active(client);
+						dump_list(active_head);
 						update_timer(tfd);
 					}
 
 				} else if(parsed == -1){
 					printf("close");
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-					close(client_fd);
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+					close(client->fd);
 					rm_active(client);
 					insert_inactive(client);
 				}
@@ -439,23 +450,26 @@ int main(){
 				struct sockaddr_in client_addr;
 				socklen_t client_len = sizeof(client_addr);
 				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
-
 				if(new_client_fd < 0)continue;
+				printf("accepted new\n");
 
 				make_nonblocking(new_client_fd);
 
 				struct epoll_event client_ev;
-				client_ev.events = EPOLLIN;
+				client_ev.events = EPOLLIN | EPOLLET;
 
 				struct conn *new_conn;
-				struct timespec ts;
+				struct timespec ts = {0};
+				clock_gettime(CLOCK_MONOTONIC, &ts);
 				if(inactive_list){
 					printf("inactive_list\n");
 					new_conn = inactive_list;
 					inactive_list = new_conn->next;
-					new_conn->fd = new_client_fd;
-					new_conn->buf_length = MIN_BUF;
+					new_conn->next = NULL;
+					new_conn->prev = NULL;
 					new_conn->buf_used = 0;
+					new_conn->buf_length = MIN_BUF;
+					new_conn->fd = new_client_fd;
 					new_conn->time = ts.tv_sec + 10;
 				} else {
 					printf("!inactive_list\n");
@@ -473,6 +487,7 @@ int main(){
 
 				client_ev.data.ptr = new_conn;
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
+
 			} else if(listen_data->listen == magic_t_val){
 				printf("magic_t_val\n");
 				uint64_t experation;
@@ -503,4 +518,3 @@ int main(){
 	arena_free();
 	return 0;
 }
-
