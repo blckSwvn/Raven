@@ -5,8 +5,6 @@ a small HTTP server in pure C with minimal external libraries
 ---
 
 ### TODO in order
-EPOLLET
-replace read with sendfile
 replace malloc with other arena local allocator that doesnt return memory to the OS and doesnt split/merge nodes
 worker threads/worker pools
 logging

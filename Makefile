@@ -1,6 +1,6 @@
 # Compiler
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -fsanitize=undefined -fsanitize=address -g
+CFLAGS = -no-pie -Wall -Wextra -O2 -fsanitize=undefined -fsanitize=address -g 
 
 INCLUDES = -I./salloc -I./picohttpparser
 

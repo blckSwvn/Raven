@@ -1,4 +1,5 @@
 #include "bits/time.h"
+#include <sys/sendfile.h>
 #include <sys/errno.h>
 #include "bits/types/struct_itimerspec.h"
 #include "picohttpparser/picohttpparser.h"
@@ -43,6 +44,9 @@ struct conn {
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
+	int file;
+	off_t offset;
+	size_t file_size;
 	struct conn *next;
 	struct conn *prev;
 	uint64_t time;
@@ -150,7 +154,7 @@ void *build_path(const char *path, size_t path_len, size_t filepath_len){
 }
 
 
-inline void handle_file_not_found(int fd){
+static inline char *handle_file_not_found(struct conn *client){
 	int f404 = open("../www/404.html", O_RDONLY);
 	if(f404 < 0){
 		const char *not_found =
@@ -158,8 +162,8 @@ inline void handle_file_not_found(int fd){
 			"Content-Type: text/html\r\n"
 			"Content-Length: 13\r\n"
 			"Connection: close\r\n\r\n";
-		send(fd, not_found, strlen(not_found), 0);
-		return;
+		send(client->fd, not_found, strlen(not_found), 0);
+		return "close";
 	} else {
 		struct stat st;
 		if (fstat(f404, &st) == 0) {
@@ -171,22 +175,31 @@ inline void handle_file_not_found(int fd){
 					"Content-Length: %jd\r\n"
 					"Connection: close\r\n\r\n",
 					(intmax_t)st.st_size);
-			send(fd, header, hlen, 0);
+			send(client->fd, header, hlen, 0);
 
-			size_t buf2_len = 4096;
-			char *buf2 = arena_alloc(buf2_len);
-			ssize_t r;
-			while ((r = read(f404, buf2, buf2_len)) > 0) {
-				send(fd, buf2, r, 0);
+			client->file_size = st.st_size;
+			// client->offset = 0;
+			ssize_t n = sendfile(client->fd, f404, &client->offset, client->file_size);
+				if(n >= st.st_size){
+					printf("n >= st.st_size\n");
+				}
+				if(errno == EAGAIN || errno == EWOULDBLOCK){
+					client->file = f404;
+					client->file_size = st.st_size;
+					return "EAGAIN";
+				}else{
+					close(f404);
+					return "close";
+				}
 			}
-		}
-		close(f404);
-		return;
+			printf("n >= st.st_size\n");
+			close(f404);
+			return "close";
 	}
 }
 
 
-const char *process_client(int fd, HTTPRequest *req){
+const char *process_client(struct conn *client, HTTPRequest *req){
 	const char *path = req->path;
 	size_t path_len = req->path_len;
 	size_t filepath_len = 512;
@@ -195,8 +208,8 @@ const char *process_client(int fd, HTTPRequest *req){
 
 	int f = open(filepath, O_RDONLY);
 	if(f < 0){
-		handle_file_not_found(fd);
-		return "close";
+		char *connection = handle_file_not_found(client);
+		return connection;
 	}
 
 	char *connection = "close";
@@ -221,24 +234,31 @@ const char *process_client(int fd, HTTPRequest *req){
 		size_t header_len = 512;
 		char *header = arena_alloc(header_len);
 		int hlen = snprintf(header, header_len,
-				"HTTP/1.1 200 OK\r\n"
-				"Content-Type: %s\r\n"
-				"Content-Length: %jd\r\n"
-				"Connection: %s\r\n\r\n",
-				mime, (intmax_t)st.st_size,
-				connection);
-		send(fd, header, hlen, 0);
-		size_t buf2_len = 4096;
-		char *buf2 = arena_alloc(buf2_len);
-		ssize_t r;
-		while((r = read(f, buf2, buf2_len)) > 0){
-			send(fd, buf2, r, 0);
+		      "HTTP/1.1 200 OK\r\n"
+		      "Content-Type: %s\r\n"
+		      "Content-Length: %jd\r\n"
+		      "Connection: %s\r\n\r\n",
+		      mime, (intmax_t)st.st_size,
+		      connection);
+		send(client->fd, header, hlen, 0);
+		ssize_t n = 0;
+		client->file_size = st.st_size;
+		// client->offset = 0;
+		n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
+		if(n < 0){
+			if(errno == EAGAIN || errno == EWOULDBLOCK){
+				client->file = f;
+				return "EAGAIN";
+			} else {
+				close(f);
+				return "close";
+			}
 		}
 	}
+	printf("n ?!?\n");
 	close(f);
 	return connection;
 }
-
 
 
 void *inactive_list = NULL;
@@ -380,6 +400,35 @@ int main(){
 
 		int i = 0;
 		while(wait > i){
+			if(events[i].events & EPOLLOUT){
+				printf("EPOLLOUT\n");
+				struct conn *client = events[i].data.ptr;
+				ssize_t n = sendfile(client->fd, client->file, &client->offset, client->file_size - client->offset);
+				if(n < 0){
+					if(errno == EAGAIN || errno == EWOULDBLOCK){
+						i++;
+						continue;
+					} else {
+					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+					close(client->file);
+					close(client->fd);
+					client->file = -1;
+					client->offset = 0;
+					rm_active(client);
+					insert_inactive(client);
+					continue;
+					}
+				}
+				if(client->offset >= client->file_size){
+					close(client->file);
+					client->file = -1;
+					client->offset = 0;
+					struct epoll_event ev;
+					ev.data.ptr = client;
+					ev.events = EPOLLIN | EPOLLET;
+					epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+				}
+			}
 			struct l_conn *listen_data = events[i].data.ptr;
 			if(listen_data->listen != magic_l_val && listen_data->listen != magic_t_val){
 				struct conn *client = events[i].data.ptr;
@@ -400,7 +449,6 @@ int main(){
 						insert_inactive(client);
 					} else {
 						if(errno == EAGAIN || errno == EWOULDBLOCK){
-							printf("errno == EAGAIN\n");
 							break;
 						}
 						else{
@@ -422,19 +470,27 @@ int main(){
 					parsed = parse_request(&req, client->buf, client->buf_used);
 				}
 				if(parsed > 0){
-					const char *connection = process_client(client->fd, &req);
-					if(strcmp(connection, "close") == 0){
-						printf("close\n");
-						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-						close(client->fd);
-						rm_active(client);
-						insert_inactive(client);
-					} else {
+					const char *connection = process_client(client, &req);
+					if(strcmp(connection, "keep-alive") == 0){
 						printf("keep-alive\n");
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
 						dump_list(active_head);
 						update_timer(tfd);
+					} else if(strcmp(connection, "EAGAIN") == 0){
+						printf("EAGAIN\n");
+						struct epoll_event ev;
+						ev.events = EPOLLOUT | EPOLLET;
+						ev.data.ptr = client;
+						epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+					} else {
+						printf("close\n");
+						printf("client->file_size, %zu\n", client->file_size);
+						printf("client->file, %d\n", client->file);
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+						close(client->fd);
+						rm_active(client);
+						insert_inactive(client);
 					}
 
 				} else if(parsed == -1){
