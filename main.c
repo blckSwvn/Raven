@@ -4,6 +4,7 @@
 #include "bits/types/struct_itimerspec.h"
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
+#include <sys/mman.h>
 #include "time.h"
 #include <sys/timerfd.h>
 #include <stdint.h>
@@ -11,7 +12,6 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <stdio.h>
-#include <malloc.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -31,7 +31,7 @@ typedef struct {
 	size_t num_headers;
 } HTTPRequest;
 
-struct l_conn {
+struct __attribute__((aligned(16))) l_conn {
 	int fd;
 	int listen;
 }; 
@@ -39,7 +39,7 @@ struct l_conn {
 #define MIN_BUF 8000 //8kb
 #define MAX_BUF 32000 //32kb
 
-struct conn {
+struct __attribute__((aligned(16))) conn {
 	int fd;
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
@@ -178,7 +178,7 @@ static inline char *handle_file_not_found(struct conn *client){
 			send(client->fd, header, hlen, 0);
 
 			client->file_size = st.st_size;
-			// client->offset = 0;
+			client->offset = 0;
 			ssize_t n = sendfile(client->fd, f404, &client->offset, client->file_size);
 				if(n >= st.st_size){
 					printf("n >= st.st_size\n");
@@ -243,7 +243,7 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		send(client->fd, header, hlen, 0);
 		ssize_t n = 0;
 		client->file_size = st.st_size;
-		// client->offset = 0;
+		client->offset = 0;
 		n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
 		if(n < 0){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
@@ -367,7 +367,8 @@ int main(){
 
 #define magic_l_val -1
 	struct epoll_event ev;
-	struct l_conn *data = malloc(sizeof(struct l_conn));
+	struct l_conn *data = mmap(NULL, sizeof(struct l_conn),
+			    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	data->listen = magic_l_val;
 	data->fd = listen_fd;
 
@@ -379,7 +380,8 @@ int main(){
 
 #define magic_t_val -2
 	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-	struct l_conn *timer = malloc(sizeof(struct l_conn));
+	struct l_conn *timer = mmap(NULL, sizeof(struct l_conn),
+			     PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	timer->fd = tfd;
 	timer->listen = magic_t_val;
 	struct epoll_event tev;
@@ -523,17 +525,21 @@ int main(){
 					inactive_list = new_conn->next;
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
+					new_conn->file = -1;
+					new_conn->offset = 0;
+					new_conn->file_size = 0;
 					new_conn->buf_used = 0;
-					new_conn->buf_length = MIN_BUF;
 					new_conn->fd = new_client_fd;
 					new_conn->time = ts.tv_sec + 10;
 				} else {
 					printf("!inactive_list\n");
-					new_conn = malloc(sizeof(struct conn));
+					new_conn = mmap(NULL, sizeof(struct conn), 
+		     					PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 					printf("new_conn:%p\n", new_conn);
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
-					new_conn->buf = malloc(MIN_BUF);
+					new_conn->buf = mmap(NULL, MIN_BUF,
+			  				PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
 					new_conn->buf_used = 0;
@@ -569,6 +575,7 @@ int main(){
 			}
 			i++;
 		}
+		arena_reset();
 
 	}
 	arena_free();
