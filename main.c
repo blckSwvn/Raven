@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -261,10 +262,9 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 }
 
 
-void *inactive_list = NULL;
-
-void *active_head = NULL;
-void *active_tail = NULL;
+thread_local void *inactive_list = NULL;
+thread_local void *active_head = NULL;
+thread_local void *active_tail = NULL;
 
 void update_timer(int tfd){
 	struct timespec ts;
@@ -342,8 +342,7 @@ static inline void insert_inactive(struct conn *client){
 	dump_list(inactive_list);
 }
 
-
-int main(){
+void *work(){
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0){
@@ -353,10 +352,12 @@ int main(){
 	adress.sin_family = AF_INET;
 	adress.sin_addr.s_addr = INADDR_ANY;
 	adress.sin_port = htons(PORT);
+	int one = 1;
+	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 
 	if(bind(listen_fd,(struct sockaddr *)&adress, sizeof(adress)) < 0){
 		perror("binds failed");	
-		return 2;
+		return NULL;
 	}
 
 	listen(listen_fd, SOMAXCONN);
@@ -581,3 +582,18 @@ int main(){
 	arena_free();
 	return 0;
 }
+
+int main(){
+	long n = sysconf(_SC_NPROCESSORS_CONF);
+	uint8_t i = 0;
+	pthread_t tid[n];
+	while(i < n){
+		pthread_create(&tid[i], NULL, work, NULL);
+		i++;
+	}
+
+	for(long i = 0; i < n; i++) {
+		pthread_join(tid[i], NULL);
+	}
+}
+

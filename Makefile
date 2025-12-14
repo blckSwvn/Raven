@@ -1,8 +1,9 @@
-# Compiler
+# Compiler and flags
 CC = gcc
-CFLAGS = -no-pie -Wall -Wextra -O2 -fsanitize=undefined -fsanitize=address -g 
+CFLAGS = -no-pie -Wall -Wextra -O2 -fsanitize=address,undefined -g
 
-INCLUDES = -I./salloc -I./picohttpparser
+# Include directories
+INCLUDES = -I./arena -I./picohttpparser
 
 # Target executable
 TARGET = main
@@ -14,7 +15,7 @@ OBJS = $(SRCS:.c=.o)
 # Default rule
 all: $(TARGET)
 
-# Link object files
+# Link object files into executable
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
