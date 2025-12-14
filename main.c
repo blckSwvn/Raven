@@ -1,4 +1,5 @@
 #include "bits/time.h"
+#include <signal.h>
 #include <sys/sendfile.h>
 #include <sys/errno.h>
 #include "bits/types/struct_itimerspec.h"
@@ -342,6 +343,12 @@ static inline void insert_inactive(struct conn *client){
 	dump_list(inactive_list);
 }
 
+volatile sig_atomic_t stop = 0;
+
+void signal_handler(int sig){
+	stop = 1;
+}
+
 void *work(){
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -398,8 +405,8 @@ void *work(){
 	printf("server listenning on port %i\n", PORT);
 
 	arena_init(1024 * 1024); //1MB
-	while(1){
-		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+	while(!stop){
+		int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
 
 		int i = 0;
 		while(wait > i){
@@ -580,6 +587,28 @@ void *work(){
 
 	}
 	arena_free();
+	struct conn *curr = active_head;
+	while(curr){
+		struct conn *next = curr->next;
+		munmap(curr->buf, curr->buf_length);	
+		if(curr->file >= 0)close(curr->file);
+		close(curr->fd);
+		munmap(curr, sizeof(struct conn));
+		curr = next;
+	}
+	curr = inactive_list;
+	while(curr){
+		struct conn *next = curr->next;
+		munmap(curr->buf, curr->buf_length);	
+		munmap(curr, sizeof(struct conn));
+		curr = next;
+	}
+
+	close(epoll_fd);
+	close(tfd);
+	close(listen_fd);
+	munmap(timer, sizeof(struct l_conn));
+	munmap(data, sizeof(struct l_conn));
 	return 0;
 }
 
@@ -592,8 +621,9 @@ int main(){
 		i++;
 	}
 
+	signal(SIGINT, signal_handler);
+
 	for(long i = 0; i < n; i++) {
 		pthread_join(tid[i], NULL);
 	}
 }
-
