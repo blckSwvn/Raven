@@ -1,5 +1,6 @@
 #include "bits/time.h"
 #include <signal.h>
+#include <stdatomic.h>
 #include <sys/sendfile.h>
 #include <sys/errno.h>
 #include "bits/types/struct_itimerspec.h"
@@ -17,11 +18,15 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <threads.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 
-#define DEBUG 1
+#define LOG_EROR 0
+#define LOG_WARN 1
+#define LOG_INFO 2
+#define LOG_DEBUG 3
 
 typedef struct {
 	const char *method;
@@ -52,6 +57,16 @@ struct __attribute__((aligned(16))) conn {
 	struct conn *next;
 	struct conn *prev;
 	uint64_t time;
+};
+
+typedef struct {
+	char msg[64];
+}log_entry;
+
+struct ring_buffer{
+	log_entry buf[256];
+	uint8_t head;
+	_Atomic uint8_t tail;
 };
 
 typedef struct {
@@ -183,7 +198,6 @@ static inline char *handle_file_not_found(struct conn *client){
 			client->offset = 0;
 			ssize_t n = sendfile(client->fd, f404, &client->offset, client->file_size);
 				if(n >= st.st_size){
-					printf("n >= st.st_size\n");
 				}
 				if(errno == EAGAIN || errno == EWOULDBLOCK){
 					client->file = f404;
@@ -194,7 +208,6 @@ static inline char *handle_file_not_found(struct conn *client){
 					return "close";
 				}
 			}
-			printf("n >= st.st_size\n");
 			close(f404);
 			return "close";
 	}
@@ -257,7 +270,6 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 			}
 		}
 	}
-	printf("n ?!?\n");
 	close(f);
 	return connection;
 }
@@ -273,9 +285,6 @@ void update_timer(int tfd){
 	uint64_t now = ts.tv_sec;
 
 	struct conn *head = active_head;
-	printf("active_head:%p\n", active_head);
-	printf("active_tail:%p\n", active_tail);
-	printf("inactive_list:%p\n", inactive_list);
 
 	time_t soonest = head->time - ts.tv_sec;
 
@@ -288,7 +297,6 @@ void update_timer(int tfd){
 void dump_list(void *list){
 	struct conn *client = list;
 
-	printf("list:%p\n",list);
 	while(client){
 		printf("%p\n", client);
 		printf("next:%p\n", client->next);
@@ -301,9 +309,6 @@ void dump_list(void *list){
 
 
 static inline void append_active(struct conn *client){
-#ifdef DEBUG
-	printf("appeand_active\n");
-#endif
 	client->next = NULL;
 	client->prev = active_tail;
 	if(active_tail){
@@ -314,14 +319,10 @@ static inline void append_active(struct conn *client){
 	}
 	active_tail = client;
 
-	dump_list(active_head);
 }
 
 
 static inline void rm_active(struct conn *client){
-#ifdef DEBUG
-	printf("rm_active\n");
-#endif
 	if(active_head == client)
 		active_head = client->next;
 	if(active_tail == client)
@@ -330,18 +331,14 @@ static inline void rm_active(struct conn *client){
 	if(client->prev)client->prev->next = client->next;
 	client->next = NULL;
 	client->prev = NULL;
-	dump_list(active_head);
 }
 
 
 static inline void insert_inactive(struct conn *client){
-#ifdef DEBUG
-	printf("insert_inactive\n");
-#endif
 	client->next = inactive_list;
 	inactive_list = client;
-	dump_list(inactive_list);
 }
+
 
 volatile sig_atomic_t stop = 0;
 
@@ -349,11 +346,36 @@ void signal_handler(int sig){
 	stop = 1;
 }
 
-void *work(){
+static struct ring_buffer rb;
+
+inline int write_log(const char *msg){
+	uint8_t tail = atomic_fetch_add_explicit(&rb.tail, 1, memory_order_relaxed);
+	uint8_t head = rb.head;
+	if(tail+1 == head)
+		return -1;
+
+	strncpy(rb.buf[tail].msg, msg, 64);
+	rb.buf[tail].msg[63] = '\0';
+	atomic_thread_fence(memory_order_release);
+	return 0;
+}
+
+
+inline int read_log(char *out){
+	uint8_t tail = atomic_load_explicit(&rb.tail, memory_order_acquire);
+	uint8_t head = rb.head;
+	if(head == tail)return -1;
+	strncpy(out, rb.buf[head].msg, 64);
+	rb.head = head +1;
+	return 0;
+}
+
+void work(){
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0){
-		perror("socket failed");
+		write_log("socket failed");
+		return;
 	} 
 
 	adress.sin_family = AF_INET;
@@ -363,13 +385,15 @@ void *work(){
 	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 
 	if(bind(listen_fd,(struct sockaddr *)&adress, sizeof(adress)) < 0){
-		perror("binds failed");	
-		return NULL;
+		write_log("bind failed");
+		return;
 	}
 
 	listen(listen_fd, SOMAXCONN);
 
 	make_nonblocking(listen_fd);
+
+	write_log("listening on Port: 8080");
 
 	int epoll_fd = epoll_create1(0);
 
@@ -402,7 +426,6 @@ void *work(){
 
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tfd, &tev);
 
-	printf("server listenning on port %i\n", PORT);
 
 	arena_init(1024 * 1024); //1MB
 	while(!stop){
@@ -411,7 +434,6 @@ void *work(){
 		int i = 0;
 		while(wait > i){
 			if(events[i].events & EPOLLOUT){
-				printf("EPOLLOUT\n");
 				struct conn *client = events[i].data.ptr;
 				ssize_t n = sendfile(client->fd, client->file, &client->offset, client->file_size - client->offset);
 				if(n < 0){
@@ -450,8 +472,6 @@ void *work(){
 					if(r > 0){
 						client->buf_used += r;
 					} else if (r == 0){
-						//client closed conn
-						printf("client closed conn\n");
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL,client->fd, NULL);
 						close(client->fd);
 						client->fd = -1;
@@ -462,7 +482,6 @@ void *work(){
 							break;
 						}
 						else{
-							printf("fatal error\n");
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->fd);
 							client->fd = -1;
@@ -482,21 +501,15 @@ void *work(){
 				if(parsed > 0){
 					const char *connection = process_client(client, &req);
 					if(strcmp(connection, "keep-alive") == 0){
-						printf("keep-alive\n");
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
-						dump_list(active_head);
 						update_timer(tfd);
 					} else if(strcmp(connection, "EAGAIN") == 0){
-						printf("EAGAIN\n");
 						struct epoll_event ev;
 						ev.events = EPOLLOUT | EPOLLET;
 						ev.data.ptr = client;
 						epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
 					} else {
-						printf("close\n");
-						printf("client->file_size, %zu\n", client->file_size);
-						printf("client->file, %d\n", client->file);
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 						close(client->fd);
 						rm_active(client);
@@ -504,7 +517,6 @@ void *work(){
 					}
 
 				} else if(parsed == -1){
-					printf("close");
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 					close(client->fd);
 					rm_active(client);
@@ -517,7 +529,6 @@ void *work(){
 				socklen_t client_len = sizeof(client_addr);
 				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
 				if(new_client_fd < 0)continue;
-				printf("accepted new\n");
 
 				make_nonblocking(new_client_fd);
 
@@ -528,7 +539,6 @@ void *work(){
 				struct timespec ts = {0};
 				clock_gettime(CLOCK_MONOTONIC, &ts);
 				if(inactive_list){
-					printf("inactive_list\n");
 					new_conn = inactive_list;
 					inactive_list = new_conn->next;
 					new_conn->next = NULL;
@@ -540,10 +550,8 @@ void *work(){
 					new_conn->fd = new_client_fd;
 					new_conn->time = ts.tv_sec + 10;
 				} else {
-					printf("!inactive_list\n");
 					new_conn = mmap(NULL, sizeof(struct conn), 
 		     					PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-					printf("new_conn:%p\n", new_conn);
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
 					new_conn->buf = mmap(NULL, MIN_BUF,
@@ -559,7 +567,6 @@ void *work(){
 				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
 
 			} else if(listen_data->listen == magic_t_val){
-				printf("magic_t_val\n");
 				uint64_t experation;
 				read(tfd, &experation, sizeof experation);
 
@@ -580,12 +587,16 @@ void *work(){
 				}
 				struct itimerspec its = {0};
 				timerfd_settime(listen_data->fd, 0, &its, NULL);
+				#ifdef LOG_DEBUG
+				write_log("LOG_DEBUG magic_t_val");
+				#endif
 			}
 			i++;
 		}
 		arena_reset();
 
 	}
+	write_log("closing worker thread");
 	arena_free();
 	struct conn *curr = active_head;
 	while(curr){
@@ -609,19 +620,35 @@ void *work(){
 	close(listen_fd);
 	munmap(timer, sizeof(struct l_conn));
 	munmap(data, sizeof(struct l_conn));
-	return 0;
+	return;
 }
 
+
 int main(){
+	rb.head = 0;
+	atomic_init(&rb.tail, 0);
+
 	long n = sysconf(_SC_NPROCESSORS_CONF);
 	uint8_t i = 0;
 	pthread_t tid[n];
+	printf("threads detected:%zu\n", n);
 	while(i < n){
 		pthread_create(&tid[i], NULL, work, NULL);
 		i++;
 	}
 
 	signal(SIGINT, signal_handler);
+
+	char msg[64];
+	while(!stop){
+		while(read_log(msg) == 0){
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			printf("%ld %s\n", ts.tv_sec, msg);
+		}
+		struct timespec ts = {0, 10000};
+		nanosleep(&ts, NULL);
+	}
 
 	for(long i = 0; i < n; i++) {
 		pthread_join(tid[i], NULL);
