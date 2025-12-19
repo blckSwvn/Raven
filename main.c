@@ -536,16 +536,12 @@ void *work(){
 						} else {
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->fd);
-							client->file_u.fd = -1;
-							client->offset = 0;
 							rm_active(client);
 							insert_inactive(client);
 							continue;
 						}
 					}
 					if(client->offset >= client->file_size){
-						client->file_u.fd = -1;
-						client->offset = 0;
 						struct epoll_event ev;
 						ev.data.ptr = client;
 						ev.events = EPOLLIN | EPOLLET;
@@ -563,16 +559,12 @@ void *work(){
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->file_u.fd);
 							close(client->fd);
-							client->file_u.fd = -1;
-							client->offset = 0;
 							rm_active(client);
 							insert_inactive(client);
 							continue;
 						}
 						if(client->offset >= client->file_size){
 							close(client->file_u.fd);
-							client->file_u.fd = -1;
-							client->offset = 0;
 							ev.data.ptr = client;
 							ev.events = EPOLLIN | EPOLLET;
 							epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
@@ -593,7 +585,6 @@ void *work(){
 					} else if (r == 0){
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL,client->fd, NULL);
 						close(client->fd);
-						client->fd = -1;
 						rm_active(client);
 						insert_inactive(client);
 					} else {
@@ -603,7 +594,6 @@ void *work(){
 						else{
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->fd);
-							client->fd = -1;
 							rm_active(client);
 							insert_inactive(client);
 						}
@@ -662,10 +652,10 @@ void *work(){
 					inactive_list = new_conn->next;
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
-					new_conn->file_u.fd = -1;
+					// new_conn->file_u.fd = -1;
 					//new_conn->out is lazily initlized
-					new_conn->offset = 0;
-					new_conn->file_size = 0;
+					// new_conn->offset = 0; laziliy initilized
+					// new_conn->file_size = 0; laziliy initlized
 					// new_conn->buf_used = 0; should inherit previous size
 					// new_conn->buf_length = MIN_BUF should inherit previous
 					new_conn->fd = new_client_fd;
@@ -675,10 +665,10 @@ void *work(){
 		     					PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
-					new_conn->file_u.fd = -1;
+					// new_conn->file_u.fd = -1;
 					//new_conn->out is lazily initlized
-					new_conn->offset = 0;
-					new_conn->file_size = 0;
+					// new_conn->offset = 0; laziliy initlized
+					// new_conn->file_size = 0; laziliy initlized
 					new_conn->buf_used = 0;
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
@@ -777,7 +767,7 @@ void init_cache(const char *dirpath){
 			ext++;
 			uint8_t i = 0;
 			//mime[9].ext and beyond are things we dont want to cache like png, jpg, jpeg
-			while(mime[i].ext && i < 8){ 
+			while(mime[i].ext && i < 8){
 				if(strcmp(ext, mime[i].ext) == 0){
 					int fd = open(fullpath, O_RDONLY);
 					struct stat st;
