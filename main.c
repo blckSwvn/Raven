@@ -1,4 +1,5 @@
 #include <bits/time.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdalign.h>
 #include <stdatomic.h>
@@ -52,18 +53,22 @@ struct cached_file{
 	struct cached_file *next;
 };
 
-typedef union {
-	int fd;
-	struct cached_file *cached;
-}file;
-
+typedef enum {
+	OUT_NONE = 0,
+	OUT_FD,
+	OUT_CACHED
+}file_out;
 
 alignas(16) struct conn {
 	int fd;
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
-	file file_u;
+	file_out out;
+	union {
+		int fd;
+		struct cached_file *cached;
+	}file_u;
 	off_t offset;
 	size_t file_size;
 	struct conn *next;
@@ -334,6 +339,7 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		if(n > 0) client->offset += n;
 		if(n < (file->size - client->offset)){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
+				client->out = OUT_CACHED;
 				client->file_u.cached = file;
 				return "EAGAIN";
 			} else return "close";
@@ -382,6 +388,7 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
 		if(n < 0){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
+				client->out = OUT_FD;
 				client->file_u.fd = f;
 				return "EAGAIN";
 			} else {
@@ -519,31 +526,58 @@ void *work(){
 		while(wait > i){
 			if(events[i].events & EPOLLOUT){
 				struct conn *client = events[i].data.ptr;
-				ssize_t n = write(client->fd, client->file_u.cached->data, client->file_size - client->offset);
-				client->offset += n;
-				if(n < 0){
-					if(errno == EAGAIN || errno == EWOULDBLOCK){
-						i++;
-						continue;
-					} else {
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-					close(client->file_u.fd);
-					close(client->fd);
-					client->file_u.fd = -1;
-					client->offset = 0;
-					rm_active(client);
-					insert_inactive(client);
-					continue;
+				if(client->out == OUT_CACHED){
+					ssize_t n = write(client->fd, client->file_u.cached->data, client->file_size - client->offset);
+					client->offset += n;
+					if(n < 0){
+						if(errno == EAGAIN || errno == EWOULDBLOCK){
+							i++;
+							continue;
+						} else {
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+							close(client->fd);
+							client->file_u.fd = -1;
+							client->offset = 0;
+							rm_active(client);
+							insert_inactive(client);
+							continue;
+						}
+					}
+					if(client->offset >= client->file_size){
+						client->file_u.fd = -1;
+						client->offset = 0;
+						struct epoll_event ev;
+						ev.data.ptr = client;
+						ev.events = EPOLLIN | EPOLLET;
+						epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
 					}
 				}
-				if(client->offset >= client->file_size){
-					close(client->file_u.fd);
-					client->file_u.fd = -1;
-					client->offset = 0;
-					struct epoll_event ev;
-					ev.data.ptr = client;
-					ev.events = EPOLLIN | EPOLLET;
-					epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+
+				else{
+					ssize_t n = sendfile(client->fd, client->file_u.fd, &client->offset, client->file_size - client->offset);
+					if(n < 0){
+						if(errno == EAGAIN || errno == EWOULDBLOCK){
+							i++;
+							continue;
+						} else {
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+							close(client->file_u.fd);
+							close(client->fd);
+							client->file_u.fd = -1;
+							client->offset = 0;
+							rm_active(client);
+							insert_inactive(client);
+							continue;
+						}
+						if(client->offset >= client->file_size){
+							close(client->file_u.fd);
+							client->file_u.fd = -1;
+							client->offset = 0;
+							ev.data.ptr = client;
+							ev.events = EPOLLIN | EPOLLET;
+							epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+						}
+					}
 				}
 			}
 			struct l_conn *listen_data = events[i].data.ptr;
@@ -629,21 +663,27 @@ void *work(){
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
 					new_conn->file_u.fd = -1;
+					//new_conn->out is lazily initlized
 					new_conn->offset = 0;
 					new_conn->file_size = 0;
-					new_conn->buf_used = 0;
+					// new_conn->buf_used = 0; should inherit previous size
+					// new_conn->buf_length = MIN_BUF should inherit previous
 					new_conn->fd = new_client_fd;
 					new_conn->time = ts.tv_sec + 10;
 				} else {
 					new_conn = mmap(NULL, sizeof(struct conn), 
 		     					PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+					new_conn->next = NULL;
+					new_conn->prev = NULL;
+					new_conn->file_u.fd = -1;
+					//new_conn->out is lazily initlized
+					new_conn->offset = 0;
+					new_conn->file_size = 0;
+					new_conn->buf_used = 0;
 					new_conn->fd = new_client_fd;
 					new_conn->buf_length = MIN_BUF;
 					new_conn->buf = mmap(NULL, MIN_BUF,
 			  				PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-					new_conn->next = NULL;
-					new_conn->prev = NULL;
-					new_conn->buf_used = 0;
 					new_conn->time = ts.tv_sec + 10;
 				}
 				append_active(new_conn);
@@ -723,7 +763,7 @@ void init_cache(const char *dirpath){
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
 			continue; // skip current and parent directories
 
-		char fullpath[512];  // buffer for full path
+		char fullpath[512];
 		snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, entry->d_name);
 
 		if (stat(fullpath, &info) != 0) {
@@ -749,7 +789,7 @@ void init_cache(const char *dirpath){
 				} 
 				i++;
 			}
-		} else if(S_ISDIR(info.st_mode)) //is Dir
+		} else if(S_ISDIR(info.st_mode))
 			init_cache(fullpath);
 	}
 	closedir(dp);
@@ -760,7 +800,7 @@ int main(){
 	rb.head = 0;
 	atomic_init(&rb.tail, 0);
 
-	init_cache("../www"); //need to munmap later
+	init_cache("../www");
 
 	uint16_t n = sysconf(_SC_NPROCESSORS_CONF);
 	uint8_t i = 0;
