@@ -1,12 +1,14 @@
-#include "bits/time.h"
+#include <bits/time.h>
 #include <signal.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <sys/sendfile.h>
 #include <sys/errno.h>
-#include "bits/types/struct_itimerspec.h"
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
 #include <sys/mman.h>
+#include <strings.h>
+#include <dirent.h>
 #include "time.h"
 #include <sys/timerfd.h>
 #include <stdint.h>
@@ -23,10 +25,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 
-#define LOG_EROR 0
-#define LOG_WARN 1
-#define LOG_INFO 2
-#define LOG_DEBUG 3
+#define LOG_DEBUG 1
 
 typedef struct {
 	const char *method;
@@ -38,7 +37,7 @@ typedef struct {
 	size_t num_headers;
 } HTTPRequest;
 
-struct __attribute__((aligned(16))) l_conn {
+alignas(16) struct l_conn {
 	int fd;
 	int listen;
 }; 
@@ -46,12 +45,25 @@ struct __attribute__((aligned(16))) l_conn {
 #define MIN_BUF 8000 //8kb
 #define MAX_BUF 32000 //32kb
 
-struct __attribute__((aligned(16))) conn {
+struct cached_file{
+	const char *path; //key
+	const char *data; //restrict with mmap for file
+	size_t size;
+	struct cached_file *next;
+};
+
+typedef union {
+	int fd;
+	struct cached_file *cached;
+}file;
+
+
+alignas(16) struct conn {
 	int fd;
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
-	int file;
+	file file_u;
 	off_t offset;
 	size_t file_size;
 	struct conn *next;
@@ -59,14 +71,15 @@ struct __attribute__((aligned(16))) conn {
 	uint64_t time;
 };
 
+
 typedef struct {
 	char msg[64];
 }log_entry;
 
 struct ring_buffer{
 	log_entry buf[256];
-	uint8_t head;
-	_Atomic uint8_t tail;
+	alignas(64) uint8_t head;
+	alignas(64) _Atomic uint8_t tail;
 };
 
 typedef struct {
@@ -80,13 +93,13 @@ static const mime_type mime[] = {
 	{"css", "text/css"},
 	{"js", "application/javascript"},
 	{"json", "application/json"},
+	{"txt", "text/plain"},
+	{"md", "text/markdown"},
+	{"svg", "image/svg+xml"},
 	{"png", "image/png"},
 	{"jpg", "image/jpeg"},
 	{"jpeg", "image/jpeg"},
 	{"gif", "image/gif"},
-	{"svg", "image/svg+xml"},
-	{"txt", "text/plain"},
-	{"md", "text/markdown"},
 	{NULL, "application/octet-stream"}
 };
 
@@ -98,6 +111,75 @@ long procs = 0;
 long all_mem = 0;
 long page_size = 0;
 long avphys_pages = 0;
+
+static struct ring_buffer rb;
+
+inline int write_log(const char *msg){
+	uint8_t tail = atomic_fetch_add_explicit(&rb.tail, 1, memory_order_relaxed);
+	uint8_t head = rb.head;
+	if(tail+1 == head)
+		return -1;
+
+	strncpy(rb.buf[tail].msg, msg, 64);
+	rb.buf[tail].msg[63] = '\0';
+	atomic_thread_fence(memory_order_release);
+	return 0;
+}
+
+
+inline int read_log(char *out){
+	uint8_t tail = atomic_load_explicit(&rb.tail, memory_order_acquire);
+	uint8_t head = rb.head;
+	if(head == tail)return -1;
+	strncpy(out, rb.buf[head].msg, 64);
+	rb.head = head +1;
+	return 0;
+}
+
+#define NUM_BUCKETS 1024
+
+static inline uint32_t hash(const char *str){
+	uint32_t hash = 5381;
+	int c;
+	while((c = *str++))
+		hash = ((hash << 5) + hash) + c;
+	return hash % NUM_BUCKETS;
+}
+
+static struct cached_file *hash_table[NUM_BUCKETS];
+
+void insert_file(const char *path, int file, size_t size){
+	uint32_t index = hash(path);
+	struct cached_file *entry = mmap(NULL, sizeof(struct cached_file), PROT_READ | PROT_WRITE,
+				  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if(!entry){
+		write_log("insert_file entry mmap = NULL");
+		return;
+	}
+
+	entry->data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, file, 0);
+	if(!entry->data){
+		write_log("insert_file entry->data mmap = NULL");
+		return;
+	}
+
+	entry->path = strdup(path);
+	entry->size = size;
+	entry->next = hash_table[index];
+	hash_table[index] = entry;
+}
+
+
+static inline struct cached_file *get_file(const char *path){
+	struct cached_file *entry = hash_table[hash(path)];
+	while(entry){
+		if(strcmp(entry->path, path) == 0)
+			return entry;
+		entry = entry->next;
+	}
+	return NULL;
+}
+
 
 long get_threads(){
 	procs = sysconf(_SC_NPROCESSORS_ONLN);
@@ -170,15 +252,14 @@ void *build_path(const char *path, size_t path_len, size_t filepath_len){
 	return filepath;
 }
 
+static const char *not_found =  "HTTP/1.1 404 Not Found\r\n"
+				"Content-Type: text/html\r\n"
+				"Content-Length: 13\r\n"
+				"Connection: close\r\n\r\n";
 
 static inline char *handle_file_not_found(struct conn *client){
 	int f404 = open("../www/404.html", O_RDONLY);
 	if(f404 < 0){
-		const char *not_found =
-			"HTTP/1.1 404 Not Found\r\n"
-			"Content-Type: text/html\r\n"
-			"Content-Length: 13\r\n"
-			"Connection: close\r\n\r\n";
 		send(client->fd, not_found, strlen(not_found), 0);
 		return "close";
 	} else {
@@ -200,7 +281,7 @@ static inline char *handle_file_not_found(struct conn *client){
 				if(n >= st.st_size){
 				}
 				if(errno == EAGAIN || errno == EWOULDBLOCK){
-					client->file = f404;
+					client->file_u.fd = f404;
 					client->file_size = st.st_size;
 					return "EAGAIN";
 				}else{
@@ -220,6 +301,45 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 	size_t filepath_len = 512;
 
 	char *filepath = build_path(path, path_len, filepath_len);
+	struct cached_file *file = get_file(filepath + strlen("../www"));
+	if(file){
+		char *connection = "close";
+		if(req->minor_version){
+			size_t i = 2;
+			while(i < req->num_headers){
+				if(strncmp(req->headers[i].name, "Connection", 10) == 0){
+					if(strncmp(req->headers[i].value, "close", 5) != 0)
+						connection = "keep-alive";
+					else connection = "close";
+					break;
+				}
+				i++;
+			}
+		} 
+
+		const char *mime = get_mime(filepath);
+		size_t header_len = 512;
+		char *header = arena_alloc(header_len);
+		int hlen = snprintf(header, header_len,
+		      "HTTP/1.1 200 OK\r\n"
+		      "Content-Type: %s\r\n"
+		      "Content-Length: %jd\r\n"
+		      "Connection: %s\r\n\r\n",
+		      mime, (intmax_t)file->size,
+		      connection);
+		send(client->fd, header, hlen, 0);
+		client->file_size = file->size;
+		client->offset = 0;
+		size_t n = write(client->fd, file->data + client->offset, file->size - client->offset);
+		if(n > 0) client->offset += n;
+		if(n < (file->size - client->offset)){
+			if(errno == EAGAIN || errno == EWOULDBLOCK){
+				client->file_u.cached = file;
+				return "EAGAIN";
+			} else return "close";
+		}
+		return connection;
+	}
 
 	int f = open(filepath, O_RDONLY);
 	if(f < 0){
@@ -262,7 +382,7 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
 		if(n < 0){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
-				client->file = f;
+				client->file_u.fd = f;
 				return "EAGAIN";
 			} else {
 				close(f);
@@ -292,20 +412,6 @@ void update_timer(int tfd){
 	its.it_value.tv_sec = soonest;
 	timerfd_settime(tfd, 0, &its, NULL);
 }
-
-#ifdef DEBUG
-void dump_list(void *list){
-	struct conn *client = list;
-
-	while(client){
-		printf("%p\n", client);
-		printf("next:%p\n", client->next);
-		printf("prev:%p\n", client->prev);
-		client = client->next;
-	}
-	printf("\n");
-}
-#endif
 
 
 static inline void append_active(struct conn *client){
@@ -343,39 +449,17 @@ static inline void insert_inactive(struct conn *client){
 volatile sig_atomic_t stop = 0;
 
 void signal_handler(int sig){
+	printf("\nserver shutdown\n");
 	stop = 1;
 }
 
-static struct ring_buffer rb;
 
-inline int write_log(const char *msg){
-	uint8_t tail = atomic_fetch_add_explicit(&rb.tail, 1, memory_order_relaxed);
-	uint8_t head = rb.head;
-	if(tail+1 == head)
-		return -1;
-
-	strncpy(rb.buf[tail].msg, msg, 64);
-	rb.buf[tail].msg[63] = '\0';
-	atomic_thread_fence(memory_order_release);
-	return 0;
-}
-
-
-inline int read_log(char *out){
-	uint8_t tail = atomic_load_explicit(&rb.tail, memory_order_acquire);
-	uint8_t head = rb.head;
-	if(head == tail)return -1;
-	strncpy(out, rb.buf[head].msg, 64);
-	rb.head = head +1;
-	return 0;
-}
-
-void work(){
+void *work(){
 	struct sockaddr_in adress;
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(listen_fd < 0){
 		write_log("socket failed");
-		return;
+		return 0;
 	} 
 
 	adress.sin_family = AF_INET;
@@ -386,7 +470,7 @@ void work(){
 
 	if(bind(listen_fd,(struct sockaddr *)&adress, sizeof(adress)) < 0){
 		write_log("bind failed");
-		return;
+		return 0;
 	}
 
 	listen(listen_fd, SOMAXCONN);
@@ -435,16 +519,17 @@ void work(){
 		while(wait > i){
 			if(events[i].events & EPOLLOUT){
 				struct conn *client = events[i].data.ptr;
-				ssize_t n = sendfile(client->fd, client->file, &client->offset, client->file_size - client->offset);
+				ssize_t n = write(client->fd, client->file_u.cached->data, client->file_size - client->offset);
+				client->offset += n;
 				if(n < 0){
 					if(errno == EAGAIN || errno == EWOULDBLOCK){
 						i++;
 						continue;
 					} else {
 					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-					close(client->file);
+					close(client->file_u.fd);
 					close(client->fd);
-					client->file = -1;
+					client->file_u.fd = -1;
 					client->offset = 0;
 					rm_active(client);
 					insert_inactive(client);
@@ -452,8 +537,8 @@ void work(){
 					}
 				}
 				if(client->offset >= client->file_size){
-					close(client->file);
-					client->file = -1;
+					close(client->file_u.fd);
+					client->file_u.fd = -1;
 					client->offset = 0;
 					struct epoll_event ev;
 					ev.data.ptr = client;
@@ -543,7 +628,7 @@ void work(){
 					inactive_list = new_conn->next;
 					new_conn->next = NULL;
 					new_conn->prev = NULL;
-					new_conn->file = -1;
+					new_conn->file_u.fd = -1;
 					new_conn->offset = 0;
 					new_conn->file_size = 0;
 					new_conn->buf_used = 0;
@@ -602,7 +687,7 @@ void work(){
 	while(curr){
 		struct conn *next = curr->next;
 		munmap(curr->buf, curr->buf_length);	
-		if(curr->file >= 0)close(curr->file);
+		if(curr->file_u.fd >= 0)close(curr->file_u.fd);
 		close(curr->fd);
 		munmap(curr, sizeof(struct conn));
 		curr = next;
@@ -620,7 +705,54 @@ void work(){
 	close(listen_fd);
 	munmap(timer, sizeof(struct l_conn));
 	munmap(data, sizeof(struct l_conn));
-	return;
+	return 0;
+}
+
+
+void init_cache(const char *dirpath){
+	struct dirent *entry;
+	struct stat info;
+	DIR *dp = opendir(dirpath);
+
+	if (!dp){
+		perror("opendir");
+		return;
+	}
+
+	while ((entry = readdir(dp)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue; // skip current and parent directories
+
+		char fullpath[512];  // buffer for full path
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, entry->d_name);
+
+		if (stat(fullpath, &info) != 0) {
+			perror("stat");
+			continue;
+		}
+
+		if(S_ISREG(info.st_mode)){ //is file
+			const char *ext = strrchr(fullpath, '.');
+			if(!ext || ext == fullpath)continue;
+			ext++;
+			uint8_t i = 0;
+			//mime[9].ext and beyond are things we dont want to cache like png, jpg, jpeg
+			while(mime[i].ext && i < 8){ 
+				if(strcmp(ext, mime[i].ext) == 0){
+					int fd = open(fullpath, O_RDONLY);
+					struct stat st;
+					fstat(fd, &st);
+					const char *key = fullpath + strlen("../www");
+					printf("key:%s\n", key);
+					insert_file(key, fd, st.st_size);
+					close(fd);
+				} 
+				i++;
+			}
+		} else if(S_ISDIR(info.st_mode)) //is Dir
+			init_cache(fullpath);
+	}
+	closedir(dp);
 }
 
 
@@ -628,10 +760,12 @@ int main(){
 	rb.head = 0;
 	atomic_init(&rb.tail, 0);
 
-	long n = sysconf(_SC_NPROCESSORS_CONF);
+	init_cache("../www"); //need to munmap later
+
+	uint16_t n = sysconf(_SC_NPROCESSORS_CONF);
 	uint8_t i = 0;
 	pthread_t tid[n];
-	printf("threads detected:%zu\n", n);
+	printf("threads detected:%d\n", n);
 	while(i < n){
 		pthread_create(&tid[i], NULL, work, NULL);
 		i++;
@@ -650,7 +784,22 @@ int main(){
 		nanosleep(&ts, NULL);
 	}
 
-	for(long i = 0; i < n; i++) {
+	uint16_t z = 0;
+	while(hash_table[z]){
+		struct cached_file *curr = hash_table[z];
+		while(curr){
+			struct cached_file *next = curr->next;
+			free((void*)curr->path);
+			munmap((void *)curr->data, curr->size);
+			munmap(curr, sizeof(struct cached_file));
+			curr = next;
+		}
+		hash_table[z] = NULL;
+		z++;
+	}
+
+	for(uint16_t i = 0; i < n; i++) {
+		printf("closing thread %d\n", i);
 		pthread_join(tid[i], NULL);
 	}
 }
