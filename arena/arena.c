@@ -1,3 +1,6 @@
+#include <stdalign.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <string.h>
 
@@ -21,12 +24,13 @@ void *arena_init(size_t size){
 
 
 void *arena_alloc(size_t size){
+	const size_t align = alignof(max_align_t);
+	uintptr_t x = (uintptr_t)m.tail;
+	void *aligned = (void *)((x + (align - 1)) & ~ (align -1));
+	if((char *)aligned + size > (char *)m.end) return NULL;
 
-	if((char *)m.tail + size > (char *)m.end) return NULL;
-
-	void *ptr = m.tail;
-	m.tail = (char *)m.tail + size;
-	return ptr;
+	m.tail = (char *)aligned + size;
+	return aligned;
 }
 
 

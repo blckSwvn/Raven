@@ -51,23 +51,29 @@ alignas(16) struct l_conn {
 
 struct cached_file{
 	const char *path; //key
-	const char *data; //restrict with mmap for file
-	size_t size;
+	const char *header; //connection: keep-alive
+	size_t header_len;
+	const char *close_header; //connection: close
+	size_t close_header_len;
+	const char *body; //restrict with mmap for file
+	size_t body_len;
 	struct cached_file *next;
 };
 
-typedef enum {
-	OUT_NONE = 0,
-	OUT_FD,
-	OUT_CACHED
-}file_out;
 
 alignas(16) struct conn {
 	int fd;
 	void *buf;
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
-	file_out out;
+	enum {
+		OUT_FD,
+		OUT_CACHED
+	}out;
+	enum {
+		CLOSE = 0,
+		KEEP_ALIVE
+	}connection;
 	union {
 		int fd;
 		struct cached_file *cached;
@@ -154,6 +160,22 @@ static inline uint32_t hash(const char *str){
 	return hash % NUM_BUCKETS;
 }
 
+
+const char *get_mime(const char *path){
+	const char *ext = strrchr(path, '.');
+	if(!ext || ext == path)return "text/plain";
+	ext++;
+	uint8_t i = 0;
+	//stops at 12 beeing {NULL, "application/octet-stream"}
+	while(mime[i].ext){
+		if(strcmp(ext, mime[i].ext) == 0){
+			return mime[i].mime;
+		}
+		i++;
+	}
+	return mime[i].mime; //aplication/octet-stream
+}
+
 static struct cached_file *hash_table[NUM_BUCKETS];
 
 void insert_file(const char *path, int file, size_t size){
@@ -161,18 +183,66 @@ void insert_file(const char *path, int file, size_t size){
 	struct cached_file *entry = mmap(NULL, sizeof(struct cached_file), PROT_READ | PROT_WRITE,
 				  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if(!entry){
-		write_log("insert_file entry mmap = NULL");
+		write_log("insert_file entry mmap == NULL");
 		return;
 	}
 
-	entry->data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, file, 0);
-	if(!entry->data){
-		write_log("insert_file entry->data mmap = NULL");
+	const char *mime = get_mime(path);
+	entry->header_len = snprintf(NULL, 0, 
+			      	"HTTP/1.1 200 OK\r\n"
+			    	"Content-Type: %s\r\n"
+			    	"Content-Length: %jd\r\n"
+			    	"Connection: keep-alive\r\n\r\n",
+			    	mime, size);
+
+	char *header = arena_alloc(entry->header_len +1);
+	if(!entry->header){
+		write_log("insert_file entry->header mmap == NULL");
 		return;
 	}
 
-	entry->path = strdup(path);
-	entry->size = size;
+	snprintf(header, entry->header_len + 1, 
+			  	"HTTP/1.1 200 OK\r\n"
+			  	"Content-Type: %s\r\n"
+			  	"Content-Length: %jd\r\n"
+			  	"Connection: keep-alive\r\n\r\n",
+			  	mime, size);
+
+	entry->close_header_len = snprintf(NULL, 0, 
+				    "HTTP/1.1 200 OK\r\n"
+				    "Content-Type: %s\r\n"
+				    "Content-Length: %jd\r\n"
+				    "Connection: close\r\n\r\n",
+				    mime, size);
+
+	char *close_header = arena_alloc(entry->close_header_len +1);
+	if(!close_header){
+		write_log("insert_file entry->close_header mmap == NULL");
+		return;
+	}
+
+	snprintf(close_header, entry->close_header_len + 1,
+	  			"HTTP/1.1 200 OK\r\n"
+	  			"Content-Type: %s\r\n"
+	  			"Content-Length: %jd\r\n"
+	  			"Connection: close\r\n\r\n",
+	  			mime, size);
+	
+
+	entry->body = mmap(NULL, size, PROT_READ, MAP_PRIVATE, file, 0);
+	if(!entry->body){
+		write_log("insert_file entry->data mmap == NULL");
+		return;
+	}
+
+	size_t path_len = strlen(path) +1;
+	char *p = arena_alloc(path_len);
+	memcpy(p, path, path_len);
+
+	entry->path = p;
+	entry->header = header;
+	entry->close_header = close_header;
+	entry->body_len = size;
 	entry->next = hash_table[index];
 	hash_table[index] = entry;
 }
@@ -206,22 +276,6 @@ inline int make_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) return -1;
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-
-const char *get_mime(const char *path){
-	const char *ext = strrchr(path, '.');
-	if(!ext || ext == path)return "text/plain";
-	ext++;
-	uint8_t i = 0;
-	//stops at 12 beeing {NULL, "application/octet-stream"}
-	while(mime[i].ext){
-		if(strcmp(ext, mime[i].ext) == 0){
-			return mime[i].mime;
-		}
-		i++;
-	}
-	return mime[i].mime; //aplication/octet-stream
 }
 
 
@@ -311,47 +365,44 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 	char *filepath = build_path(path, path_len, filepath_len);
 	struct cached_file *file = get_file(filepath + strlen("../www"));
 	if(file){
+		struct iovec iov[2];
 		char *connection = "close";
 		if(req->minor_version){
 			size_t i = 2;
 			while(i < req->num_headers){
 				if(strncmp(req->headers[i].name, "Connection", 10) == 0){
-					if(strncmp(req->headers[i].value, "close", 5) != 0)
+					if(strncmp(req->headers[i].value, "close", 5) != 0){
 						connection = "keep-alive";
-					else connection = "close";
+						client->connection = KEEP_ALIVE;
+						iov[0].iov_base = (void *)file->header;
+						iov[0].iov_len = file->header_len;
+					} else {
+						connection = "close";
+						client->connection = CLOSE;
+						iov[0].iov_base = (void *)file->close_header;
+						iov[0].iov_len = file->close_header_len;
+					} 
 					break;
 				}
 				i++;
 			}
 		} 
 
-		const char *mime = get_mime(filepath);
-		size_t header_len = 512;
-		char *header = arena_alloc(header_len);
-		int hlen = snprintf(header, header_len,
-		      "HTTP/1.1 200 OK\r\n"
-		      "Content-Type: %s\r\n"
-		      "Content-Length: %jd\r\n"
-		      "Connection: %s\r\n\r\n",
-		      mime, (intmax_t)file->size,
-		      connection);
-		struct iovec iov[2];
-		iov[0].iov_base = header;
-		iov[0].iov_len = hlen;
-
-		client->file_size = file->size;
+		client->file_size = file->body_len;
 		client->offset = 0;
-		iov[1].iov_base = (void*)file->data + client->offset;
-		iov[1].iov_len = file->size - client->offset;
+		iov[1].iov_base = (void*)file->body + client->offset;
+		iov[1].iov_len = file->body_len - client->offset;
 		ssize_t n = writev(client->fd, iov, 2);
+
 		if(n > 0) client->offset += n;
-		if(n < (file->size - client->offset)){
+		if(client->offset < file->header_len + file->body_len){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
 				client->out = OUT_CACHED;
 				client->file_u.cached = file;
 				return "EAGAIN";
 			} else return "close";
 		}
+
 		return connection;
 	}
 
@@ -368,8 +419,10 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 			if(strncmp(req->headers[i].name, "Connection", 10) == 0){
 				if(strncmp(req->headers[i].value, "close", 5) != 0){
 					connection = "keep-alive";
+					client->connection = KEEP_ALIVE;
 				} else {
 					connection = "close";
+					client->connection = CLOSE;
 				}
 				break;
 			}
@@ -535,31 +588,61 @@ void *work(){
 				write_log("EPOLLOUT");
 				struct conn *client = events[i].data.ptr;
 				if(client->out == OUT_CACHED){
-					ssize_t n = write(client->fd,
-		       client->file_u.cached->data + client->offset,
-		       client->file_size - client->offset);
-					client->offset += n;
+					struct iovec iov[2];
+					iov[1].iov_base = (void *)client->file_u.cached->body;
+					iov[1].iov_len = client->file_u.cached->body_len;
+					void *header;
+					size_t header_len;
+
+					if(client->connection == KEEP_ALIVE){
+						header = (void *)client->file_u.cached->header;
+						header_len = client->file_u.cached->header_len;
+					} else {
+						header = (void *)client->file_u.cached->close_header;
+						header_len = client->file_u.cached->close_header_len;
+					}
+					iov[0].iov_base = header;
+					iov[0].iov_len = header_len;
+
+					size_t temp = iov[0].iov_len;
+					iov[0].iov_len = header_len - client->offset;
+					iov[0].iov_base = ((char *)header + client->offset);
+					if(client->offset >= temp){
+						client->offset -= temp;
+						iov[1].iov_len = client->file_u.cached->body_len - client->offset;
+						iov[1].iov_base = ((char *)client->file_u.cached->body + client->offset);
+						client->offset = 0;
+					}
+
+					ssize_t n = writev(client->fd, iov, 2);
 					if(n < 0){
-						if(errno == EAGAIN || errno == EWOULDBLOCK){
-							i++;
-							continue;
-						} else {
+						if(errno == EAGAIN || errno == EWOULDBLOCK) continue;
+						else {
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->fd);
 							rm_active(client);
 							insert_inactive(client);
 							continue;
 						}
+					} else {
+						client->offset += n;
 					}
-					if(client->offset >= client->file_size){
+					if(client->offset < (header_len + client->file_u.cached->body_len)){
+						if(errno == EAGAIN || errno == EWOULDBLOCK)
+							continue;
+						else {
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+							close(client->fd);
+							rm_active(client);
+							insert_inactive(client);
+						}
+					} else {
 						struct epoll_event ev;
 						ev.data.ptr = client;
 						ev.events = EPOLLIN | EPOLLET;
 						epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
 					}
-				}
-
-				else{
+				}else{
 					ssize_t n = sendfile(client->fd, client->file_u.fd, &client->offset, client->file_size - client->offset);
 					if(n < 0){
 						if(errno == EAGAIN || errno == EWOULDBLOCK){
@@ -845,7 +928,7 @@ int main(){
 		while(curr){
 			struct cached_file *next = curr->next;
 			free((void*)curr->path);
-			munmap((void *)curr->data, curr->size);
+			munmap((void *)curr->body, curr->body_len);
 			munmap(curr, sizeof(struct cached_file));
 			curr = next;
 		}

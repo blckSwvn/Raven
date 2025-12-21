@@ -5,4 +5,4 @@ a small HTTP server in pure C with minimal external libraries
 ---
 
 ### TODO in order
-cache headers for cached files
+accept 4 to avoid seperate accept, fnctl
