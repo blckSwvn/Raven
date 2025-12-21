@@ -27,6 +27,7 @@
 #include <sys/epoll.h>
 
 #define LOG_DEBUG 1
+#define DEBUG
 
 typedef struct {
 	const char *method;
@@ -382,10 +383,9 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		      mime, (intmax_t)st.st_size,
 		      connection);
 		send(client->fd, header, hlen, 0);
-		ssize_t n = 0;
 		client->file_size = st.st_size;
 		client->offset = 0;
-		n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
+		ssize_t n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
 		if(n < 0){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
 				client->out = OUT_FD;
@@ -525,9 +525,12 @@ void *work(){
 		int i = 0;
 		while(wait > i){
 			if(events[i].events & EPOLLOUT){
+				write_log("EPOLLOUT");
 				struct conn *client = events[i].data.ptr;
 				if(client->out == OUT_CACHED){
-					ssize_t n = write(client->fd, client->file_u.cached->data, client->file_size - client->offset);
+					ssize_t n = write(client->fd,
+		       client->file_u.cached->data + client->offset,
+		       client->file_size - client->offset);
 					client->offset += n;
 					if(n < 0){
 						if(errno == EAGAIN || errno == EWOULDBLOCK){
@@ -563,12 +566,12 @@ void *work(){
 							insert_inactive(client);
 							continue;
 						}
-						if(client->offset >= client->file_size){
-							close(client->file_u.fd);
-							ev.data.ptr = client;
-							ev.events = EPOLLIN | EPOLLET;
-							epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
-						}
+					}
+					if(client->offset >= client->file_size){
+						close(client->file_u.fd);
+						ev.data.ptr = client;
+						ev.events = EPOLLIN | EPOLLET;
+						epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
 					}
 				}
 			}
@@ -577,27 +580,31 @@ void *work(){
 				struct conn *client = events[i].data.ptr;
 
 				while(1){
-					int r = read(client->fd,
-							client->buf + client->buf_used,
-							client->buf_length - client->buf_used);
-					if(r > 0){
+					// write_log("read");
+					ssize_t r = read(client->fd,
+		      client->buf + client->buf_used,
+		      client->buf_length - client->buf_used);
+					if(r > 0)
 						client->buf_used += r;
-					} else if (r == 0){
-						epoll_ctl(epoll_fd, EPOLL_CTL_DEL,client->fd, NULL);
+					else if(r == 0){ //client closed
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 						close(client->fd);
 						rm_active(client);
 						insert_inactive(client);
+						break;
 					} else {
 						if(errno == EAGAIN || errno == EWOULDBLOCK){
+							// write_log("read EAGAIN");
 							break;
-						}
-						else{
+						} else {//error
+							// write_log("read error");
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
 							close(client->fd);
 							rm_active(client);
 							insert_inactive(client);
+							break;
 						}
-					} 
+					}
 				}
 
 				HTTPRequest req;
@@ -631,56 +638,65 @@ void *work(){
 					rm_active(client);
 					insert_inactive(client);
 				}
+
 			} else if(listen_data->listen == magic_l_val){
 
 				//new client
 				struct sockaddr_in client_addr;
 				socklen_t client_len = sizeof(client_addr);
-				int new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
-				if(new_client_fd < 0)continue;
+				int new_client_fd;
+				while(1){
+					// write_log("accept");
+					new_client_fd = accept(listen_fd,(struct sockaddr *)&client_addr, &client_len);
+					if(new_client_fd < 0){
+						if(errno == EAGAIN || errno == EWOULDBLOCK)
+							break;
+					} else {
+						make_nonblocking(new_client_fd);
 
-				make_nonblocking(new_client_fd);
 
-				struct epoll_event client_ev;
-				client_ev.events = EPOLLIN | EPOLLET;
+						struct conn *new_conn;
+						struct timespec ts = {0};
+						clock_gettime(CLOCK_MONOTONIC, &ts);
+						if(inactive_list){
+							new_conn = inactive_list;
+							inactive_list = new_conn->next;
+							new_conn->next = NULL;
+							new_conn->prev = NULL;
+							// new_conn->file_u.fd = -1;
+							//new_conn->out is lazily initlized
+							// new_conn->offset = 0; laziliy initilized
+							// new_conn->file_size = 0; laziliy initlized
+							new_conn->buf_used = 0;
+							// new_conn->buf_length = MIN_BUF should inherit previous
+							new_conn->fd = new_client_fd;
+							new_conn->time = ts.tv_sec + 10;
+						} else {
+							new_conn = mmap(NULL, sizeof(struct conn), 
+		       PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+							new_conn->next = NULL;
+							new_conn->prev = NULL;
+							// new_conn->file_u.fd = -1;
+							//new_conn->out is lazily initlized
+							// new_conn->offset = 0; laziliy initlized
+							// new_conn->file_size = 0; laziliy initlized
+							new_conn->buf_used = 0;
+							new_conn->fd = new_client_fd;
+							new_conn->buf_length = MIN_BUF;
+							new_conn->buf = mmap(NULL, MIN_BUF,
+			    PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+							new_conn->time = ts.tv_sec + 10;
+						}
+						append_active(new_conn);
+						update_timer(tfd);
 
-				struct conn *new_conn;
-				struct timespec ts = {0};
-				clock_gettime(CLOCK_MONOTONIC, &ts);
-				if(inactive_list){
-					new_conn = inactive_list;
-					inactive_list = new_conn->next;
-					new_conn->next = NULL;
-					new_conn->prev = NULL;
-					// new_conn->file_u.fd = -1;
-					//new_conn->out is lazily initlized
-					// new_conn->offset = 0; laziliy initilized
-					// new_conn->file_size = 0; laziliy initlized
-					// new_conn->buf_used = 0; should inherit previous size
-					// new_conn->buf_length = MIN_BUF should inherit previous
-					new_conn->fd = new_client_fd;
-					new_conn->time = ts.tv_sec + 10;
-				} else {
-					new_conn = mmap(NULL, sizeof(struct conn), 
-		     					PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-					new_conn->next = NULL;
-					new_conn->prev = NULL;
-					// new_conn->file_u.fd = -1;
-					//new_conn->out is lazily initlized
-					// new_conn->offset = 0; laziliy initlized
-					// new_conn->file_size = 0; laziliy initlized
-					new_conn->buf_used = 0;
-					new_conn->fd = new_client_fd;
-					new_conn->buf_length = MIN_BUF;
-					new_conn->buf = mmap(NULL, MIN_BUF,
-			  				PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-					new_conn->time = ts.tv_sec + 10;
+						struct epoll_event client_ev;
+						client_ev.events = EPOLLIN | EPOLLET;
+						client_ev.data.ptr = new_conn;
+						epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
+						continue;
+					}
 				}
-				append_active(new_conn);
-
-				client_ev.data.ptr = new_conn;
-				epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &client_ev);
-
 			} else if(listen_data->listen == magic_t_val){
 				uint64_t experation;
 				read(tfd, &experation, sizeof experation);
@@ -691,6 +707,7 @@ void *work(){
 				struct conn *curr = active_head;
 
 				while(curr){
+					// write_log("magic_t_val");
 					struct conn *next = curr->next;
 					if(curr->time <= now.tv_sec){
 						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr->fd, NULL);
@@ -702,9 +719,9 @@ void *work(){
 				}
 				struct itimerspec its = {0};
 				timerfd_settime(listen_data->fd, 0, &its, NULL);
-				#ifdef LOG_DEBUG
+#ifdef LOG_DEBUG
 				write_log("LOG_DEBUG magic_t_val");
-				#endif
+#endif
 			}
 			i++;
 		}
@@ -787,6 +804,7 @@ void init_cache(const char *dirpath){
 
 
 int main(){
+	printf("server pid:%d\n", getpid());
 	rb.head = 0;
 	atomic_init(&rb.tail, 0);
 
