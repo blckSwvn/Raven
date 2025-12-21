@@ -1,10 +1,12 @@
 #include <bits/time.h>
+#include <sys/uio.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <sys/sendfile.h>
 #include <sys/errno.h>
+#include "bits/types/struct_iovec.h"
 #include "picohttpparser/picohttpparser.h"
 #include "arena/arena.h"
 #include <sys/mman.h>
@@ -333,10 +335,15 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		      "Connection: %s\r\n\r\n",
 		      mime, (intmax_t)file->size,
 		      connection);
-		send(client->fd, header, hlen, 0);
+		struct iovec iov[2];
+		iov[0].iov_base = header;
+		iov[0].iov_len = hlen;
+
 		client->file_size = file->size;
 		client->offset = 0;
-		size_t n = write(client->fd, file->data + client->offset, file->size - client->offset);
+		iov[1].iov_base = (void*)file->data + client->offset;
+		iov[1].iov_len = file->size - client->offset;
+		ssize_t n = writev(client->fd, iov, 2);
 		if(n > 0) client->offset += n;
 		if(n < (file->size - client->offset)){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
