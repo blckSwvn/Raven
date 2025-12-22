@@ -67,12 +67,13 @@ alignas(16) struct conn {
 	uint16_t buf_length; //starts at MIN_BUF
 	uint16_t buf_used;
 	enum {
-		OUT_FD,
+		OUT_SENDFILE,
 		OUT_CACHED
 	}out;
 	enum {
-		CLOSE = 0,
-		KEEP_ALIVE
+		CLIENT_CLOSE = 0,
+		CLIENT_KEEP_ALIVE = 1,
+		CLIENT_EAGAIN = 2,
 	}connection;
 	union {
 		int fd;
@@ -319,11 +320,11 @@ static const char *not_found =  "HTTP/1.1 404 Not Found\r\n"
 				"Content-Length: 13\r\n"
 				"Connection: close\r\n\r\n";
 
-static inline char *handle_file_not_found(struct conn *client){
+static inline uint32_t handle_file_not_found(struct conn *client){
 	int f404 = open("../www/404.html", O_RDONLY);
 	if(f404 < 0){
 		send(client->fd, not_found, strlen(not_found), 0);
-		return "close";
+		return CLIENT_CLOSE;
 	} else {
 		struct stat st;
 		if (fstat(f404, &st) == 0) {
@@ -345,40 +346,40 @@ static inline char *handle_file_not_found(struct conn *client){
 				if(errno == EAGAIN || errno == EWOULDBLOCK){
 					client->file_u.fd = f404;
 					client->file_size = st.st_size;
-					return "EAGAIN";
+					return CLIENT_EAGAIN;
 				}else{
 					close(f404);
-					return "close";
+					return CLIENT_CLOSE;
 				}
 			}
 			close(f404);
-			return "close";
+			return CLIENT_CLOSE;
 	}
 }
 
 
-const char *process_client(struct conn *client, HTTPRequest *req){
+const uint32_t process_client(struct conn *client, HTTPRequest *req){
 	const char *path = req->path;
 	size_t path_len = req->path_len;
 	size_t filepath_len = 512;
 
 	char *filepath = build_path(path, path_len, filepath_len);
 	struct cached_file *file = get_file(filepath + strlen("../www"));
+	uint32_t connection = CLIENT_CLOSE;
 	if(file){
 		struct iovec iov[2];
-		char *connection = "close";
 		if(req->minor_version){
 			size_t i = 2;
 			while(i < req->num_headers){
 				if(strncmp(req->headers[i].name, "Connection", 10) == 0){
 					if(strncmp(req->headers[i].value, "close", 5) != 0){
-						connection = "keep-alive";
-						client->connection = KEEP_ALIVE;
+						connection = CLIENT_KEEP_ALIVE;
+						client->connection = CLIENT_KEEP_ALIVE;
 						iov[0].iov_base = (void *)file->header;
 						iov[0].iov_len = file->header_len;
 					} else {
-						connection = "close";
-						client->connection = CLOSE;
+						connection = CLIENT_CLOSE;
+						client->connection = CLIENT_CLOSE;
 						iov[0].iov_base = (void *)file->close_header;
 						iov[0].iov_len = file->close_header_len;
 					} 
@@ -399,8 +400,8 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
 				client->out = OUT_CACHED;
 				client->file_u.cached = file;
-				return "EAGAIN";
-			} else return "close";
+				return CLIENT_EAGAIN;
+			} else return CLIENT_CLOSE;
 		}
 
 		return connection;
@@ -408,21 +409,20 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 
 	int f = open(filepath, O_RDONLY);
 	if(f < 0){
-		char *connection = handle_file_not_found(client);
+		connection = handle_file_not_found(client);
 		return connection;
 	}
 
-	char *connection = "close";
 	if(req->minor_version){
 		size_t i = 2;
 		while(i < req->num_headers){
 			if(strncmp(req->headers[i].name, "Connection", 10) == 0){
 				if(strncmp(req->headers[i].value, "close", 5) != 0){
-					connection = "keep-alive";
-					client->connection = KEEP_ALIVE;
+					connection = CLIENT_KEEP_ALIVE;
+					client->connection = CLIENT_KEEP_ALIVE;
 				} else {
-					connection = "close";
-					client->connection = CLOSE;
+					connection = CLIENT_CLOSE;
+					client->connection = CLIENT_CLOSE;
 				}
 				break;
 			}
@@ -431,6 +431,12 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 	}
 
 	const char *mime = get_mime(filepath);
+	
+	static const char * connection_type[] = {
+		[CLIENT_CLOSE] = "close",
+		[CLIENT_KEEP_ALIVE] = "keep-alive",
+	};
+
 	struct stat st;
 	if(fstat(f, &st) == 0){
 		size_t header_len = 512;
@@ -441,19 +447,19 @@ const char *process_client(struct conn *client, HTTPRequest *req){
 		      "Content-Length: %jd\r\n"
 		      "Connection: %s\r\n\r\n",
 		      mime, (intmax_t)st.st_size,
-		      connection);
+		      connection_type[connection]);
 		send(client->fd, header, hlen, 0);
 		client->file_size = st.st_size;
 		client->offset = 0;
 		ssize_t n = sendfile(client->fd, f, &client->offset, client->file_size - client->offset);
 		if(n < 0){
 			if(errno == EAGAIN || errno == EWOULDBLOCK){
-				client->out = OUT_FD;
+				client->out = OUT_SENDFILE;
 				client->file_u.fd = f;
-				return "EAGAIN";
+				return CLIENT_EAGAIN;
 			} else {
 				close(f);
-				return "close";
+				return CLIENT_CLOSE;
 			}
 		}
 	}
@@ -594,7 +600,7 @@ void *work(){
 					void *header;
 					size_t header_len;
 
-					if(client->connection == KEEP_ALIVE){
+					if(client->connection == CLIENT_KEEP_ALIVE){
 						header = (void *)client->file_u.cached->header;
 						header_len = client->file_u.cached->header_len;
 					} else {
@@ -705,12 +711,12 @@ void *work(){
 					parsed = parse_request(&req, client->buf, client->buf_used);
 				}
 				if(parsed > 0){
-					const char *connection = process_client(client, &req);
-					if(strcmp(connection, "keep-alive") == 0){
+					const uint32_t connection = process_client(client, &req);
+					if(connection == CLIENT_KEEP_ALIVE){
 						memmove(client->buf, client->buf + parsed, client->buf_used - parsed);
 						client->buf_used -= parsed;
 						update_timer(tfd);
-					} else if(strcmp(connection, "EAGAIN") == 0){
+					} else if(connection == CLIENT_EAGAIN){
 						struct epoll_event ev;
 						ev.events = EPOLLOUT | EPOLLET;
 						ev.data.ptr = client;
@@ -897,6 +903,7 @@ int main(){
 	printf("server pid:%d\n", getpid());
 	rb.head = 0;
 	atomic_init(&rb.tail, 0);
+	arena_init(1024 * 1024);
 
 	init_cache("../www");
 
@@ -927,7 +934,6 @@ int main(){
 		struct cached_file *curr = hash_table[z];
 		while(curr){
 			struct cached_file *next = curr->next;
-			free((void*)curr->path);
 			munmap((void *)curr->body, curr->body_len);
 			munmap(curr, sizeof(struct cached_file));
 			curr = next;
@@ -935,6 +941,7 @@ int main(){
 		hash_table[z] = NULL;
 		z++;
 	}
+	arena_free();
 
 	for(uint16_t i = 0; i < n; i++) {
 		printf("closing thread %d\n", i);
