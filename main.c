@@ -33,6 +33,8 @@
 #define LOG_DEBUG 1
 #define DEBUG
 
+#define PORT 8080
+
 typedef struct {
 	const char *method;
 	size_t method_len;
@@ -120,7 +122,6 @@ static const mime_type mime[] = {
 	{NULL, "application/octet-stream"}
 };
 
-#define PORT 8080
 #define MAX_EVENTS 255
 
 long procs = 0;
