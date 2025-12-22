@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 #include <bits/time.h>
 #include <sys/uio.h>
 #include <errno.h>
@@ -263,13 +265,6 @@ static inline struct cached_file *get_file(const char *path){
 long get_threads(){
 	procs = sysconf(_SC_NPROCESSORS_ONLN);
 	return procs;
-}
-
-
-void get_mem(){
-	page_size = sysconf(_SC_PHYS_PAGES);
-	avphys_pages = sysconf(_SC_AVPHYS_PAGES);
-	all_mem = page_size * avphys_pages;
 }
 
 
@@ -898,6 +893,17 @@ void init_cache(const char *dirpath){
 	closedir(dp);
 }
 
+void pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    pthread_t thread = pthread_self();
+    int s = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    if (s != 0) {
+        perror("pthread_setaffinity_np");
+    }
+}
 
 int main(){
 	printf("server pid:%d\n", getpid());
@@ -913,6 +919,8 @@ int main(){
 	printf("threads detected:%d\n", n);
 	while(i < n){
 		pthread_create(&tid[i], NULL, work, NULL);
+		pin_thread_to_core(i % n);
+
 		i++;
 	}
 
